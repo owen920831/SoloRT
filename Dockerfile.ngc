@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1.7
+
+FROM nvcr.io/nvidia/pytorch:24.07-py3
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app/src \
+    SOLORT_EXECUTOR=transformers \
+    SOLORT_MODEL_ID=Qwen/Qwen3-0.6B \
+    SOLORT_DEVICE_MAP=auto \
+    SOLORT_TORCH_DTYPE=auto \
+    SOLORT_ENABLE_THINKING=0
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY tests ./tests
+COPY benchmarks ./benchmarks
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -e ".[dev]" \
+    && python -m pip install "accelerate>=0.34" "transformers>=4.51.0,<5"
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"
+
+CMD ["uvicorn", "solort.api.server:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
