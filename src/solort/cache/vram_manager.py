@@ -1,4 +1,4 @@
-"""Conservative VRAM budget policy for the mock runtime."""
+"""Conservative VRAM budget policy for local serving."""
 
 from __future__ import annotations
 

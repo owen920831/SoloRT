@@ -46,7 +46,10 @@ class RuntimeMetrics:
             if timing.first_token_ts is not None
         ]
         tpots = []
+        ttots = []
         for timing in self._timings.values():
+            if timing.finished_ts is not None:
+                ttots.append(timing.finished_ts - timing.created_ts)
             if len(timing.token_timestamps) < 2:
                 continue
             gaps = [
@@ -65,4 +68,16 @@ class RuntimeMetrics:
             "tokens_generated": self.tokens_generated,
             "avg_ttft_seconds": sum(ttfts) / len(ttfts) if ttfts else None,
             "avg_tpot_seconds": sum(tpots) / len(tpots) if tpots else None,
+            "avg_itl_seconds": sum(tpots) / len(tpots) if tpots else None,
+            "avg_ttot_seconds": sum(ttots) / len(ttots) if ttots else None,
+            "overall_tps": (
+                self.tokens_generated / sum(ttots)
+                if ttots and sum(ttots) > 0
+                else None
+            ),
+            "decode_tps": (
+                len(tpots) / sum(tpots)
+                if tpots and sum(tpots) > 0
+                else None
+            ),
         }

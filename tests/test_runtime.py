@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+from tests.fakes import DeterministicExecutor
+
 from solort.cache.kv_cache import KVCacheConfig, PagedKVCache
 from solort.cache.prefix_cache import PrefixCache
 from solort.core.runtime import RuntimeCore
@@ -25,10 +27,29 @@ class BurstDecodeExecutor:
         ]
 
 
+class MetadataCaptureExecutor:
+    name = "metadata-capture"
+    supports_prefix_cache = False
+
+    def __init__(self) -> None:
+        self.prefill_batches = []
+        self.decode_batches = []
+
+    def forward_prefill(self, batch: object) -> None:
+        self.prefill_batches.append(batch)
+
+    def forward_decode(self, batch: object) -> SampleResult:
+        self.decode_batches.append(batch)
+        return SampleResult(token_id=9, text="x", finished=True)
+
+
 def test_runtime_non_streaming_completion_and_metrics() -> None:
-    runtime = RuntimeCore(kv_cache=PagedKVCache(KVCacheConfig(num_pages=64, page_size=4)))
+    runtime = RuntimeCore(
+        executor=DeterministicExecutor(),
+        kv_cache=PagedKVCache(KVCacheConfig(num_pages=64, page_size=4)),
+    )
     sequence = runtime.add_request(
-        model_id="mock",
+        model_id="test",
         messages=[Message(role="user", content="say hello")],
         max_new_tokens=3,
     )
@@ -38,7 +59,7 @@ def test_runtime_non_streaming_completion_and_metrics() -> None:
 
     assert content == "SoloRT keeps foreground"
     assert metrics["runtime"]["tokens_generated"] == 3
-    assert metrics["executor"] == "mock"
+    assert metrics["executor"] == "deterministic-test"
     assert metrics["kv_cache"]["used_pages"] >= 1
 
 
@@ -61,8 +82,31 @@ def test_runtime_accepts_multi_token_decode_results() -> None:
     assert metrics["runtime"]["tokens_generated"] == 3
 
 
+def test_runtime_attaches_paged_kv_metadata_to_batches() -> None:
+    executor = MetadataCaptureExecutor()
+    runtime = RuntimeCore(
+        kv_cache=PagedKVCache(KVCacheConfig(num_pages=64, page_size=4)),
+        executor=executor,
+    )
+    sequence = runtime.add_request(
+        model_id="metadata",
+        messages=[Message(role="user", content="one two three four five")],
+        max_new_tokens=1,
+    )
+
+    asyncio.run(runtime.complete_request(sequence))
+    prefill_batch = executor.prefill_batches[0]
+    decode_batch = executor.decode_batches[0]
+
+    assert prefill_batch.page_indptr == [0, len(prefill_batch.page_indices)]
+    assert prefill_batch.last_page_len
+    assert prefill_batch.slot_mapping == prefill_batch.positions
+    assert decode_batch.page_indptr == [0, len(decode_batch.page_indices)]
+    assert decode_batch.slot_mapping
+
+
 def test_runtime_stores_real_model_request_metadata() -> None:
-    runtime = RuntimeCore()
+    runtime = RuntimeCore(executor=DeterministicExecutor())
     sequence = runtime.add_request(
         model_id="Qwen/Qwen3-0.6B",
         messages=[Message(role="user", content="metadata check")],
@@ -90,24 +134,28 @@ def test_runtime_stores_real_model_request_metadata() -> None:
 
 def test_runtime_prefix_cache_hit_on_repeated_prompt() -> None:
     runtime = RuntimeCore(
+        executor=DeterministicExecutor(),
         kv_cache=PagedKVCache(KVCacheConfig(num_pages=64, page_size=4)),
         prefix_cache=PrefixCache(block_size=2, max_entries=8),
     )
     messages = [Message(role="user", content="repeat this prompt")]
 
-    first = runtime.add_request(model_id="mock", messages=messages, max_new_tokens=1)
+    first = runtime.add_request(model_id="test", messages=messages, max_new_tokens=1)
     asyncio.run(runtime.complete_request(first))
 
-    second = runtime.add_request(model_id="mock", messages=messages, max_new_tokens=1)
+    second = runtime.add_request(model_id="test", messages=messages, max_new_tokens=1)
     asyncio.run(runtime.complete_request(second))
 
     assert runtime.metrics_snapshot()["prefix_cache"]["hits"] >= 1
 
 
 def test_runtime_uses_session_history_as_chat_context() -> None:
-    runtime = RuntimeCore(kv_cache=PagedKVCache(KVCacheConfig(num_pages=64, page_size=4)))
+    runtime = RuntimeCore(
+        executor=DeterministicExecutor(),
+        kv_cache=PagedKVCache(KVCacheConfig(num_pages=64, page_size=4)),
+    )
     first = runtime.add_request(
-        model_id="mock",
+        model_id="test",
         session_id="chat",
         messages=[Message(role="user", content="first question")],
         max_new_tokens=2,
@@ -124,7 +172,7 @@ def test_runtime_uses_session_history_as_chat_context() -> None:
     ]
 
     second = runtime.add_request(
-        model_id="mock",
+        model_id="test",
         session_id="chat",
         messages=[Message(role="user", content="second question")],
         max_new_tokens=1,
@@ -141,9 +189,9 @@ def test_runtime_uses_session_history_as_chat_context() -> None:
 
 
 def test_runtime_cancels_active_request() -> None:
-    runtime = RuntimeCore()
+    runtime = RuntimeCore(executor=DeterministicExecutor())
     sequence = runtime.add_request(
-        model_id="mock",
+        model_id="test",
         messages=[Message(role="user", content="cancel me")],
         max_new_tokens=8,
     )

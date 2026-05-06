@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Chat with SoloRT and print only assistant text.")
     parser.add_argument("prompt", nargs="*", help="Prompt text. Omit for interactive mode.")
     parser.add_argument("--url", default="http://127.0.0.1:8000")
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--model", default="Qwen/Qwen3-4B")
     parser.add_argument("--session-id", default="chat")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.7)

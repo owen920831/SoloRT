@@ -23,7 +23,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "Qwen/Qwen3-0.6B"
+    model: str = "Qwen/Qwen3-4B"
     messages: list[ChatMessage] = Field(min_length=1)
     stream: bool = False
     max_tokens: int = Field(default=16, ge=1, le=4096)

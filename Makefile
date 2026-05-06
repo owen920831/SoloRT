@@ -1,14 +1,15 @@
 IMAGE ?= solort:dev
-LLM_IMAGE ?= solort:qwen3-0.6b
-NGC_IMAGE ?= solort:qwen3-0.6b-ngc
+LLM_IMAGE ?= solort:qwen3-4b-spec
+NGC_IMAGE ?= solort:qwen3-4b-spec-ngc
 CONTAINER ?= solort-api
 PORT ?= 8000
+BASELINE_PORT ?= 8002
 CPU_PORT ?= 8001
-HF_HOME ?= /tmp/solort-hf-cache
+HF_HOME ?= $(HOME)/.cache/huggingface
 QWEN06B_MODEL ?= Qwen/Qwen3-0.6B
 QWEN4B_MODEL ?= Qwen/Qwen3-4B
 
-.PHONY: docker-build docker-up docker-down docker-test docker-lint docker-shell docker-llm-build docker-llm-up docker-llm-shell docker-ngc-build docker-ngc-up docker-ngc-up-qwen4b docker-ngc-up-cpu docker-ngc-probe docker-ngc-shell docker-serving-bench compose-up compose-test compose-lint
+.PHONY: docker-build docker-down docker-test docker-lint docker-shell docker-llm-build docker-llm-up docker-llm-shell docker-ngc-build docker-ngc-up docker-ngc-up-qwen4b docker-ngc-up-nospec docker-ngc-up-cpu docker-ngc-probe docker-ngc-shell docker-hf-prefetch docker-serving-bench docker-spec-bench compose-test compose-lint
 
 docker-build:
 	docker build --target dev -t $(IMAGE) .
@@ -19,15 +20,6 @@ docker-llm-build:
 docker-ngc-build:
 	docker build -f Dockerfile.ngc -t $(NGC_IMAGE) .
 
-docker-up:
-	docker run --rm --name $(CONTAINER) -p $(PORT):8000 \
-		-v $(PWD)/src:/app/src \
-		-v $(PWD)/tests:/app/tests \
-		-v $(PWD)/benchmarks:/app/benchmarks \
-		-v $(PWD)/README.md:/app/README.md \
-		-v $(PWD)/pyproject.toml:/app/pyproject.toml \
-		$(IMAGE)
-
 docker-down:
 	-docker rm -f $(CONTAINER)
 
@@ -37,6 +29,7 @@ docker-test:
 		-v $(PWD)/tests:/app/tests \
 		-v $(PWD)/benchmarks:/app/benchmarks \
 		-v $(PWD)/README.md:/app/README.md \
+		-v $(PWD)/docs:/app/docs \
 		-v $(PWD)/pyproject.toml:/app/pyproject.toml \
 		$(IMAGE) pytest
 
@@ -46,6 +39,7 @@ docker-lint:
 		-v $(PWD)/tests:/app/tests \
 		-v $(PWD)/benchmarks:/app/benchmarks \
 		-v $(PWD)/README.md:/app/README.md \
+		-v $(PWD)/docs:/app/docs \
 		-v $(PWD)/pyproject.toml:/app/pyproject.toml \
 		$(IMAGE) ruff check .
 
@@ -55,21 +49,32 @@ docker-shell:
 		-v $(PWD)/tests:/app/tests \
 		-v $(PWD)/benchmarks:/app/benchmarks \
 		-v $(PWD)/README.md:/app/README.md \
+		-v $(PWD)/docs:/app/docs \
 		-v $(PWD)/pyproject.toml:/app/pyproject.toml \
 		$(IMAGE) /bin/bash
 
 docker-llm-up:
+	mkdir -p $(HF_HOME)
 	docker run --rm --gpus all --name $(CONTAINER)-qwen -p $(PORT):8000 \
-		-e SOLORT_EXECUTOR=transformers \
-		-e SOLORT_MODEL_ID=$(QWEN06B_MODEL) \
+		-e SOLORT_EXECUTOR=paged \
+		-e SOLORT_MODEL_ID=$(QWEN4B_MODEL) \
+		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
+		-e SOLORT_SPECULATIVE_TOKENS=4 \
+		-e SOLORT_ATTENTION_BACKEND=flashinfer \
 		-e SOLORT_ENABLE_THINKING=0 \
+		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
 		$(LLM_IMAGE)
 
 docker-llm-shell:
+	mkdir -p $(HF_HOME)
 	docker run --rm -it --gpus all \
-		-e SOLORT_EXECUTOR=transformers \
-		-e SOLORT_MODEL_ID=$(QWEN06B_MODEL) \
+		-e SOLORT_EXECUTOR=paged \
+		-e SOLORT_MODEL_ID=$(QWEN4B_MODEL) \
+		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
+		-e SOLORT_SPECULATIVE_TOKENS=4 \
+		-e SOLORT_ATTENTION_BACKEND=flashinfer \
+		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
 		$(LLM_IMAGE) /bin/bash
 
@@ -78,9 +83,13 @@ docker-ngc-up:
 	docker run --rm --gpus all --ipc=host \
 		--ulimit memlock=-1 --ulimit stack=67108864 \
 		--name $(CONTAINER)-ngc -p $(PORT):8000 \
-		-e SOLORT_EXECUTOR=transformers \
-		-e SOLORT_MODEL_ID=$(QWEN06B_MODEL) \
+		-e SOLORT_EXECUTOR=paged \
+		-e SOLORT_MODEL_ID=$(QWEN4B_MODEL) \
+		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
+		-e SOLORT_SPECULATIVE_TOKENS=4 \
+		-e SOLORT_ATTENTION_BACKEND=flashinfer \
 		-e SOLORT_ENABLE_THINKING=0 \
+		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
 		$(NGC_IMAGE)
 
@@ -89,9 +98,28 @@ docker-ngc-up-qwen4b:
 	docker run --rm --gpus all --ipc=host \
 		--ulimit memlock=-1 --ulimit stack=67108864 \
 		--name $(CONTAINER)-ngc -p $(PORT):8000 \
-		-e SOLORT_EXECUTOR=transformers \
+		-e SOLORT_EXECUTOR=paged \
 		-e SOLORT_MODEL_ID=$(QWEN4B_MODEL) \
+		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
+		-e SOLORT_SPECULATIVE_TOKENS=4 \
+		-e SOLORT_ATTENTION_BACKEND=flashinfer \
 		-e SOLORT_ENABLE_THINKING=0 \
+		-e HF_HOME=/root/.cache/huggingface \
+		-v $(HF_HOME):/root/.cache/huggingface \
+		$(NGC_IMAGE)
+
+docker-ngc-up-nospec:
+	mkdir -p $(HF_HOME)
+	docker run --rm --gpus all --ipc=host \
+		--ulimit memlock=-1 --ulimit stack=67108864 \
+		--name $(CONTAINER)-ngc-nospec -p $(BASELINE_PORT):8000 \
+		-e SOLORT_EXECUTOR=paged \
+		-e SOLORT_MODEL_ID=$(QWEN4B_MODEL) \
+		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID= \
+		-e SOLORT_SPECULATIVE_TOKENS=0 \
+		-e SOLORT_ATTENTION_BACKEND=flashinfer \
+		-e SOLORT_ENABLE_THINKING=0 \
+		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
 		$(NGC_IMAGE)
 
@@ -104,6 +132,7 @@ docker-ngc-up-cpu:
 		-e SOLORT_DEVICE_MAP=cpu \
 		-e SOLORT_TORCH_DTYPE=float32 \
 		-e SOLORT_ENABLE_THINKING=0 \
+		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
 		$(NGC_IMAGE)
 
@@ -111,6 +140,16 @@ docker-serving-bench:
 	python benchmarks/bench_serving.py \
 		--case gpu=http://127.0.0.1:$(PORT) \
 		--case cpu=http://127.0.0.1:$(CPU_PORT)
+
+docker-spec-bench:
+	python benchmarks/bench_serving.py \
+		--case spec=http://127.0.0.1:$(PORT) \
+		--case nospec=http://127.0.0.1:$(BASELINE_PORT) \
+		--model $(QWEN4B_MODEL) \
+		--temperature 0 \
+		--max-tokens 128 \
+		--warmup 1 \
+		--runs 3
 
 docker-ngc-probe:
 	docker run --rm --gpus all --ipc=host \
@@ -121,13 +160,26 @@ docker-ngc-shell:
 	mkdir -p $(HF_HOME)
 	docker run --rm -it --gpus all --ipc=host \
 		--ulimit memlock=-1 --ulimit stack=67108864 \
-		-e SOLORT_EXECUTOR=transformers \
-		-e SOLORT_MODEL_ID=$(QWEN06B_MODEL) \
+		-e SOLORT_EXECUTOR=paged \
+		-e SOLORT_MODEL_ID=$(QWEN4B_MODEL) \
+		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
+		-e SOLORT_SPECULATIVE_TOKENS=4 \
+		-e SOLORT_ATTENTION_BACKEND=flashinfer \
+		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
 		$(NGC_IMAGE) /bin/bash
 
-compose-up:
-	docker compose up --build solort
+docker-hf-prefetch:
+	mkdir -p $(HF_HOME)
+	docker run --rm --ipc=host \
+		--ulimit memlock=-1 --ulimit stack=67108864 \
+		-e HF_HOME=/root/.cache/huggingface \
+		-e HF_HUB_ENABLE_HF_TRANSFER=1 \
+		-e QWEN4B_MODEL=$(QWEN4B_MODEL) \
+		-e QWEN06B_MODEL=$(QWEN06B_MODEL) \
+		-v $(HF_HOME):/root/.cache/huggingface \
+		-v $(PWD)/scripts:/app/scripts \
+		$(NGC_IMAGE) python /app/scripts/prefetch_hf_models.py
 
 compose-test:
 	docker compose --profile test run --rm test

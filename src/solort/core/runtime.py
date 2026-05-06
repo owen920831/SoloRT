@@ -8,7 +8,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator, Iterable
 
-from solort.cache.kv_cache import KVCacheConfig, PagedKVCache
+from solort.cache.kv_cache import KVCacheConfig, KVCacheMetadata, PagedKVCache
 from solort.cache.prefix_cache import PrefixCache, PrefixMatch
 from solort.cache.vram_manager import VRAMBudgetManager
 from solort.core.batch import Batch
@@ -17,8 +17,8 @@ from solort.core.scheduler import InteractiveScheduler
 from solort.core.sequence import BatchPhase, Sequence, SequenceStatus, TaskKind
 from solort.core.session import Message, SessionManager
 from solort.model.executor import (
-    MockModelExecutor,
     ModelExecutor,
+    PagedQwenExecutor,
     TransformersGenerationConfig,
     TransformersTextExecutor,
     messages_to_metadata,
@@ -46,7 +46,9 @@ class RuntimeCore:
         self.scheduler = scheduler or InteractiveScheduler()
         self.kv_cache = kv_cache or PagedKVCache(KVCacheConfig(num_pages=1024, page_size=16))
         self.prefix_cache = prefix_cache or PrefixCache(block_size=16, max_entries=128)
-        self.executor = executor or MockModelExecutor()
+        if executor is None:
+            raise ValueError("RuntimeCore requires an executor; use build_default_runtime()")
+        self.executor = executor
         self.session_manager = session_manager or SessionManager()
         self.metrics = metrics or RuntimeMetrics()
         self.vram_manager = vram_manager or VRAMBudgetManager()
@@ -176,7 +178,10 @@ class RuntimeCore:
                 sequence.num_cached_tokens + sequence.num_scheduled_tokens + len(batch.input_ids)
             )
             self.kv_cache.ensure_capacity(sequence.block_table, total_tokens_after_chunk)
-            batch.page_indices = list(sequence.block_table)
+            self._attach_kv_metadata(
+                batch,
+                token_count=total_tokens_after_chunk,
+            )
             self.executor.forward_prefill(batch)
             self.scheduler.postprocess_batch(batch)
             if (
@@ -195,7 +200,7 @@ class RuntimeCore:
 
         total_tokens_after_decode = sequence.num_prompt_tokens + len(sequence.output_ids) + 1
         self.kv_cache.ensure_capacity(sequence.block_table, total_tokens_after_decode)
-        batch.page_indices = list(sequence.block_table)
+        self._attach_kv_metadata(batch, token_count=total_tokens_after_decode)
         samples = self._normalize_samples(self.executor.forward_decode(batch))
         token_texts: list[str] = []
         for sample in samples:
@@ -254,6 +259,19 @@ class RuntimeCore:
             return sample_or_samples
         raise TypeError("executor.forward_decode must return SampleResult or list[SampleResult]")
 
+    def _attach_kv_metadata(self, batch: Batch, *, token_count: int) -> KVCacheMetadata:
+        sequence = batch.seqs[0]
+        metadata = self.kv_cache.metadata_for(
+            sequence.block_table,
+            token_count=token_count,
+            positions=batch.positions,
+        )
+        batch.page_indptr = metadata.page_indptr
+        batch.page_indices = metadata.page_indices
+        batch.last_page_len = metadata.last_page_len
+        batch.slot_mapping = metadata.slot_mapping
+        return metadata
+
     def _executor_snapshot(self) -> dict[str, object]:
         snapshot = getattr(self.executor, "snapshot", None)
         if callable(snapshot):
@@ -289,22 +307,43 @@ class RuntimeCore:
 
 
 def build_default_runtime() -> RuntimeCore:
-    executor_name = os.getenv("SOLORT_EXECUTOR", "mock").strip().lower()
-    if executor_name in {"transformers", "hf", "qwen"}:
-        executor: ModelExecutor = TransformersTextExecutor(
+    executor_name = os.getenv("SOLORT_EXECUTOR", "paged").strip().lower()
+    if executor_name in {"paged", "paged-qwen", "qwen-paged"}:
+        executor = PagedQwenExecutor(
             TransformersGenerationConfig(
-                model_id=os.getenv("SOLORT_MODEL_ID", "Qwen/Qwen3-0.6B"),
+                model_id=os.getenv("SOLORT_MODEL_ID", "Qwen/Qwen3-4B"),
                 device_map=os.getenv("SOLORT_DEVICE_MAP", "auto"),
                 torch_dtype=os.getenv("SOLORT_TORCH_DTYPE", "auto"),
                 enable_thinking=_env_bool("SOLORT_ENABLE_THINKING", default=False),
                 trust_remote_code=_env_bool("SOLORT_TRUST_REMOTE_CODE", default=False),
-                speculative_draft_model_id=os.getenv("SOLORT_SPECULATIVE_DRAFT_MODEL_ID"),
-                speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=0),
+                speculative_draft_model_id=os.getenv(
+                    "SOLORT_SPECULATIVE_DRAFT_MODEL_ID",
+                    "Qwen/Qwen3-0.6B",
+                ),
+                speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=4),
                 speculative_draft_device_map=os.getenv("SOLORT_SPECULATIVE_DRAFT_DEVICE_MAP"),
+                attention_backend=os.getenv("SOLORT_ATTENTION_BACKEND", "flashinfer"),
+            )
+        )
+    elif executor_name in {"transformers", "hf", "qwen"}:
+        executor: ModelExecutor = TransformersTextExecutor(
+            TransformersGenerationConfig(
+                model_id=os.getenv("SOLORT_MODEL_ID", "Qwen/Qwen3-4B"),
+                device_map=os.getenv("SOLORT_DEVICE_MAP", "auto"),
+                torch_dtype=os.getenv("SOLORT_TORCH_DTYPE", "auto"),
+                enable_thinking=_env_bool("SOLORT_ENABLE_THINKING", default=False),
+                trust_remote_code=_env_bool("SOLORT_TRUST_REMOTE_CODE", default=False),
+                speculative_draft_model_id=os.getenv(
+                    "SOLORT_SPECULATIVE_DRAFT_MODEL_ID",
+                    "Qwen/Qwen3-0.6B",
+                ),
+                speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=4),
+                speculative_draft_device_map=os.getenv("SOLORT_SPECULATIVE_DRAFT_DEVICE_MAP"),
+                attention_backend=os.getenv("SOLORT_ATTENTION_BACKEND", "auto"),
             )
         )
     else:
-        executor = MockModelExecutor()
+        raise ValueError(f"unknown SOLORT_EXECUTOR={executor_name!r}")
     return RuntimeCore(executor=executor)
 
 

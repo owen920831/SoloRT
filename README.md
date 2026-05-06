@@ -29,30 +29,31 @@ Non-goals for the first version:
 
 ```mermaid
 flowchart TD
-    A[Client / CLI / Local App] --> B[OpenAI-Compatible API Server]
+    A[CLI / Local App / curl] --> B[OpenAI-Compatible API]
     B --> C[Session Manager]
-    C --> D[Interactive Scheduler]
+    C --> D[Foreground-First Scheduler]
+    D --> E[Batch Builder]
+    E --> F[VRAM Budget Policy]
+    F --> G[Paged KV Cache]
+    F --> H[Session Prefix Cache]
 
-    D --> E[Foreground Queue]
-    D --> F[Background Queue]
-    D --> G[Batch Builder]
+    E --> I[Target Executor<br/>Qwen3-4B]
+    I --> J[Draft Executor<br/>Qwen3-0.6B]
+    I --> K[Attention Backend]
+    K --> L[FlashInfer Paged Decode]
+    K --> M[flash-attn / torch Prefill]
 
-    G --> H[VRAM Budget Manager]
-    H --> I[Paged KV Cache Manager]
-    H --> J[Session Prefix Cache]
-
-    G --> K[Model Executor]
-    K --> L[Attention Backend]
-    K --> M[Sampler]
-
-    L --> N[Mock / Eager Backend]
-    L --> O[Transformers Qwen Executor]
-    L --> R[FlashInfer Backend]
-    L --> P[Future C++ / CUDA Kernels]
-
-    M --> Q[Streaming Response]
-    Q --> B
+    G --> N[Page Tables<br/>slot_mapping / indptr / indices]
+    N --> K
+    I --> O[Sampler]
+    O --> P[Streaming Response]
+    P --> B
 ```
+
+The default real-model serving target is `Qwen/Qwen3-4B` with `Qwen/Qwen3-0.6B` as the greedy
+speculative draft model. The current executor is a Transformers bridge: SoloRT owns scheduling,
+page metadata, prefix-cache policy, and speculative metrics, while Hugging Face still executes the
+Qwen layers until the custom paged layer runner replaces that boundary.
 
 ## Request Lifecycle
 
@@ -79,19 +80,42 @@ sequenceDiagram
     API-->>U: token chunk
 ```
 
+## Speculative Decode Flow
+
+```mermaid
+sequenceDiagram
+    participant SCH as Scheduler
+    participant KV as Paged KV Cache
+    participant D as Draft Qwen3-0.6B
+    participant T as Target Qwen3-4B
+    participant S as Stream
+
+    SCH->>D: propose K greedy tokens
+    D-->>SCH: draft tokens
+    SCH->>KV: reserve provisional pages
+    SCH->>T: validate draft span in one target pass
+    T-->>SCH: target greedy tokens
+    alt accepted prefix
+        SCH->>KV: commit accepted pages
+        SCH->>S: stream accepted tokens
+    else rejected token
+        SCH->>KV: rollback provisional pages
+        SCH->>S: stream target correction
+    end
+```
+
 ## Runtime Status
 
-This repository contains both a lightweight mock executor for unit tests and a real text-serving
-executor for `Qwen/Qwen3-0.6B`. The real-model path uses Hugging Face Transformers with an explicit
-serving loop:
+SoloRT's real-model path uses Hugging Face Transformers with an explicit serving loop:
 
 1. the scheduler chunks prefill work;
 2. the executor feeds each prompt chunk into the model and accumulates `past_key_values`;
 3. decode runs one token at a time;
 4. the API streams each token through OpenAI-style SSE events.
 
-The future FlashInfer/CUDA path will replace the cache and attention internals behind the same
-API-facing shape.
+The FlashInfer-facing cache metadata is now produced by SoloRT. The next executor milestone is to
+replace the Transformers `past_key_values` bridge with a Qwen layer runner that writes directly into
+SoloRT's tensor-backed paged KV cache.
 
 - `POST /v1/chat/completions` with OpenAI-style request/response shapes.
 - Streaming and non-streaming completions.
@@ -103,71 +127,26 @@ API-facing shape.
 
 ## First Real Model Target
 
-The first enabled real-model target is `Qwen/Qwen3-0.6B`, used through a Hugging Face
-Transformers executor. The Qwen model card lists it as a 0.6B causal language model with 28 layers,
-GQA attention, a 32K context length, Apache-2.0 licensing, and support for switching Qwen3 thinking
-mode on or off. SoloRT defaults thinking mode off for the fast local-chat path.
+The primary real-model target is `Qwen/Qwen3-4B`, used with `Qwen/Qwen3-0.6B` as the default
+speculative draft model. SoloRT defaults Qwen thinking mode off for the fast local-chat path.
 
-This Transformers executor is intentionally small and readable: it proves the OpenAI-compatible API,
-session manager, foreground scheduler, prefill phase, decode phase, and streaming path with a real
-small LLM, while the paged-KV/FlashInfer/CUDA executor remains the long-term runtime path.
+The current executor keeps Qwen layer assembly in Transformers while routing attention through the
+SoloRT FlashInfer bridge. The full tensor-backed paged-KV executor remains the long-term runtime
+path.
 
 References:
 
+- [Qwen/Qwen3-4B model card](https://huggingface.co/Qwen/Qwen3-4B)
 - [Qwen/Qwen3-0.6B model card](https://huggingface.co/Qwen/Qwen3-0.6B)
 - [Qwen3 collection](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f)
+- [SoloRT architecture notes](docs/architecture.md)
 
-## Quick Start
+## Development Checks
 
-Install in editable mode:
+Install local development dependencies when working outside Docker:
 
 ```bash
 python -m pip install -e ".[dev]"
-```
-
-Run the mock API:
-
-```bash
-uvicorn solort.api.server:create_app --factory --reload
-```
-
-Send a non-streaming request:
-
-```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "Qwen/Qwen3-0.6B",
-    "messages": [{"role": "user", "content": "Explain SoloRT in one sentence."}],
-    "max_tokens": 8
-  }'
-```
-
-Send a streaming request:
-
-```bash
-curl -N http://127.0.0.1:8000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "Qwen/Qwen3-0.6B",
-    "stream": true,
-    "messages": [{"role": "user", "content": "Stream a tiny mock answer."}],
-    "max_tokens": 8
-  }'
-```
-
-For a cleaner terminal chat view that prints only assistant text, use the built-in client:
-
-```bash
-PYTHONPATH=src python -m solort.cli \
-  --session-id chat-test \
-  "我剛剛說的專案代號是什麼？請只回答代號。"
-```
-
-Or start an interactive session:
-
-```bash
-PYTHONPATH=src python -m solort.cli --session-id chat-test
 ```
 
 Run checks:
@@ -177,75 +156,48 @@ pytest
 ruff check .
 ```
 
-## Docker Quick Start
-
-The default Docker path runs the mock MVP API. It does not require a GPU or model weights.
-
-Build the dev image:
+The same checks are available in Docker:
 
 ```bash
-docker build --target dev -t solort:dev .
-```
-
-Start the API:
-
-```bash
-docker run --rm --name solort-api -p 8000:8000 \
-  -v "$PWD/src:/app/src" \
-  -v "$PWD/tests:/app/tests" \
-  -v "$PWD/benchmarks:/app/benchmarks" \
-  -v "$PWD/README.md:/app/README.md" \
-  -v "$PWD/pyproject.toml:/app/pyproject.toml" \
-  solort:dev
-```
-
-Open the health endpoint:
-
-```bash
-curl http://127.0.0.1:8000/health
-```
-
-Send a local chat completion:
-
-```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "Qwen/Qwen3-0.6B",
-    "messages": [{"role": "user", "content": "Explain SoloRT in one sentence."}],
-    "max_tokens": 8
-  }'
-```
-
-Run tests and lint inside Docker:
-
-```bash
-docker run --rm \
-  -v "$PWD/src:/app/src" \
-  -v "$PWD/tests:/app/tests" \
-  -v "$PWD/benchmarks:/app/benchmarks" \
-  -v "$PWD/README.md:/app/README.md" \
-  -v "$PWD/pyproject.toml:/app/pyproject.toml" \
-  solort:dev pytest
-
-docker run --rm \
-  -v "$PWD/src:/app/src" \
-  -v "$PWD/tests:/app/tests" \
-  -v "$PWD/benchmarks:/app/benchmarks" \
-  -v "$PWD/README.md:/app/README.md" \
-  -v "$PWD/pyproject.toml:/app/pyproject.toml" \
-  solort:dev ruff check .
-```
-
-Useful make targets are also available:
-
-```bash
-make docker-up
 make docker-test
 make docker-lint
 ```
 
-### Docker Qwen3-0.6B Path
+## Serving Quick Start
+
+Build the NGC image, prefetch the model weights, then start the GPU server:
+
+```bash
+make docker-ngc-build
+make docker-hf-prefetch
+make docker-ngc-up
+```
+
+In a second terminal, send a streaming request:
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-4B",
+    "stream": true,
+    "messages": [{"role": "user", "content": "用繁體中文簡短介紹 SoloRT。"}],
+    "max_tokens": 128,
+    "temperature": 0
+  }'
+```
+
+For a cleaner terminal chat view:
+
+```bash
+PYTHONPATH=src python -m solort.cli \
+  --url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-4B \
+  --session-id chat-test \
+  --temperature 0
+```
+
+### Docker Qwen3-4B + 0.6B Speculative Path
 
 Preferred GPU path: build from the NVIDIA NGC PyTorch container:
 
@@ -276,30 +228,59 @@ Start the Qwen3 API:
 make docker-llm-up
 ```
 
-To run the larger Qwen3 4B model on the NGC GPU path:
+The default NGC target runs `Qwen/Qwen3-4B` as the target model and `Qwen/Qwen3-0.6B` as the
+draft model for greedy speculative decoding:
 
 ```bash
 make docker-ngc-build
 make docker-ngc-up-qwen4b
 ```
 
-This uses `Qwen/Qwen3-4B` through the same Transformers executor. On an RTX 4080 16 GB-class card,
-use the GPU path; CPU serving for 4B is intentionally not wired as a default target because it is
-not practical for interactive chat.
+On an RTX 4080 16 GB-class card, use the GPU path; CPU serving for 4B is intentionally not wired as
+a default target because it is not practical for interactive chat.
 
 You can also override the model on any NGC target:
 
 ```bash
-make docker-ngc-up QWEN06B_MODEL=Qwen/Qwen3-4B
+make docker-ngc-up QWEN4B_MODEL=Qwen/Qwen3-4B QWEN06B_MODEL=Qwen/Qwen3-0.6B
 ```
 
-The first startup downloads `Qwen/Qwen3-0.6B` into `~/.cache/huggingface`, which is mounted into the
+The first startup downloads both Qwen models into `~/.cache/huggingface`, which is mounted into the
 container so later runs can reuse the weights. The default runtime environment is:
 
 ```text
-SOLORT_EXECUTOR=transformers
-SOLORT_MODEL_ID=Qwen/Qwen3-0.6B
+SOLORT_EXECUTOR=paged
+SOLORT_MODEL_ID=Qwen/Qwen3-4B
+SOLORT_SPECULATIVE_DRAFT_MODEL_ID=Qwen/Qwen3-0.6B
+SOLORT_SPECULATIVE_TOKENS=4
+SOLORT_ATTENTION_BACKEND=flashinfer
 SOLORT_ENABLE_THINKING=0
+```
+
+`SOLORT_ATTENTION_BACKEND=flashinfer` registers a Hugging Face attention bridge named
+`solort_flashinfer`. Qwen3 layers are still assembled by Transformers, but their dense prefill and
+decode attention calls dispatch to FlashInfer kernels. The tensor-backed paged-KV runner remains the
+next milestone.
+
+To avoid waiting during server startup, prefetch the target and draft models once:
+
+```bash
+make docker-ngc-build
+make docker-hf-prefetch
+```
+
+All Docker LLM targets mount the same host cache by default:
+
+```text
+HF_HOME=$HOME/.cache/huggingface
+container path=/root/.cache/huggingface
+```
+
+If you want the cache somewhere else, pass one path consistently:
+
+```bash
+make docker-hf-prefetch HF_HOME=/data/hf-cache
+make docker-ngc-up HF_HOME=/data/hf-cache
 ```
 
 Speculative decoding is available for deterministic decoding (`temperature=0`) when a draft model
@@ -309,24 +290,23 @@ is configured:
 docker run --rm --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   --name solort-api-ngc-spec -p 8000:8000 \
-  -e SOLORT_EXECUTOR=transformers \
-  -e SOLORT_MODEL_ID=Qwen/Qwen3-0.6B \
+  -e SOLORT_EXECUTOR=paged \
+  -e SOLORT_MODEL_ID=Qwen/Qwen3-4B \
   -e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=Qwen/Qwen3-0.6B \
   -e SOLORT_SPECULATIVE_TOKENS=4 \
   -e SOLORT_ENABLE_THINKING=0 \
-  -v /tmp/solort-hf-cache:/root/.cache/huggingface \
-  solort:qwen3-0.6b-ngc
+  -e HF_HOME=/root/.cache/huggingface \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  solort:qwen3-4b-spec-ngc
 ```
 
-Using the same model as the draft is useful as a correctness check, but it is usually not faster.
-Real speedup requires a smaller draft model with a compatible tokenizer. Speculative counters are
-exposed from `/metrics` under `executor_stats`.
+Speculative counters are exposed from `/metrics` under `executor_stats`.
 
 The LLM image installs the PyTorch CUDA 12.6 wheel by default because this project targets consumer
 NVIDIA machines where the host driver may not support CUDA 13 yet. Override at build time if needed:
 
 ```bash
-docker build --target llm -t solort:qwen3-0.6b \
+docker build --target llm -t solort:qwen3-4b-spec \
   --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 .
 ```
 
@@ -336,7 +316,7 @@ Then call the same OpenAI-style endpoint:
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "Qwen/Qwen3-0.6B",
+    "model": "Qwen/Qwen3-4B",
     "messages": [{"role": "user", "content": "Give me a short SoloRT status update."}],
     "max_tokens": 64,
     "temperature": 0.7,
@@ -346,7 +326,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-On a CPU-only host this small model can still be slow. For a CUDA path, use the GPU profile or run
+On a CPU-only host this model is not practical for interactive chat. For a CUDA path, use the GPU profile or run
 the image with NVIDIA Container Toolkit enabled.
 
 To compare GPU and CPU serving latency, start one GPU endpoint on `8000` and one CPU endpoint on
@@ -395,7 +375,7 @@ Phase 1: Python-only MVP
 - Session manager and foreground-first scheduler.
 - Chunked prefill/decode split.
 - Paged KV metadata and block-hash prefix cache.
-- Mock executor for tests and Qwen3 Transformers executor for real local serving.
+- Qwen3 Transformers executor with the SoloRT FlashInfer attention bridge.
 
 Phase 2: Python + CUDA kernels
 

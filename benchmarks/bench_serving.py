@@ -216,7 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Endpoint to benchmark as LABEL=URL. Repeat for cpu/gpu comparison.",
     )
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--model", default="Qwen/Qwen3-4B")
     parser.add_argument("--prompt", default="Explain SoloRT in one concise sentence.")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)

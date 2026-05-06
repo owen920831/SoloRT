@@ -13,5 +13,5 @@ class ModelConfig:
     text_only: bool = True
 
 
-def load_model_config(model_id: str = "Qwen/Qwen3-0.6B") -> ModelConfig:
+def load_model_config(model_id: str = "Qwen/Qwen3-4B") -> ModelConfig:
     return ModelConfig(model_id=model_id)

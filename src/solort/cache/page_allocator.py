@@ -1,4 +1,4 @@
-"""Page allocator for the mock paged KV cache."""
+"""Page allocator for the paged KV cache."""
 
 from __future__ import annotations
 

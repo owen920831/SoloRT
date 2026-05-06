@@ -1,21 +1,4 @@
 services:
-  solort:
-    build:
-      context: .
-      target: dev
-    image: solort:dev
-    container_name: solort-api
-    ports:
-      - "8000:8000"
-    environment:
-      PYTHONPATH: /app/src
-    volumes:
-      - ./src:/app/src
-      - ./tests:/app/tests
-      - ./benchmarks:/app/benchmarks
-      - ./README.md:/app/README.md
-      - ./pyproject.toml:/app/pyproject.toml
-
   test:
     build:
       context: .
@@ -30,6 +13,7 @@ services:
       - ./tests:/app/tests
       - ./benchmarks:/app/benchmarks
       - ./README.md:/app/README.md
+      - ./docs:/app/docs
       - ./pyproject.toml:/app/pyproject.toml
     command: pytest
 
@@ -47,6 +31,7 @@ services:
       - ./tests:/app/tests
       - ./benchmarks:/app/benchmarks
       - ./README.md:/app/README.md
+      - ./docs:/app/docs
       - ./pyproject.toml:/app/pyproject.toml
     command: ruff check .
 
@@ -54,16 +39,20 @@ services:
     build:
       context: .
       target: llm
-    image: solort:qwen3-0.6b
+    image: solort:qwen3-4b-spec
     profiles:
       - gpu
     ports:
       - "8000:8000"
     environment:
       PYTHONPATH: /app/src
-      SOLORT_EXECUTOR: transformers
-      SOLORT_MODEL_ID: ${SOLORT_MODEL_ID:-Qwen/Qwen3-0.6B}
+      SOLORT_EXECUTOR: ${SOLORT_EXECUTOR:-paged}
+      SOLORT_MODEL_ID: ${SOLORT_MODEL_ID:-Qwen/Qwen3-4B}
+      SOLORT_SPECULATIVE_DRAFT_MODEL_ID: ${SOLORT_SPECULATIVE_DRAFT_MODEL_ID:-Qwen/Qwen3-0.6B}
+      SOLORT_SPECULATIVE_TOKENS: ${SOLORT_SPECULATIVE_TOKENS:-4}
+      SOLORT_ATTENTION_BACKEND: ${SOLORT_ATTENTION_BACKEND:-flashinfer}
       SOLORT_ENABLE_THINKING: "0"
+      HF_HOME: /root/.cache/huggingface
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
@@ -71,8 +60,9 @@ services:
       - ./tests:/app/tests
       - ./benchmarks:/app/benchmarks
       - ./README.md:/app/README.md
+      - ./docs:/app/docs
       - ./pyproject.toml:/app/pyproject.toml
-      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
     deploy:
       resources:
         reservations:

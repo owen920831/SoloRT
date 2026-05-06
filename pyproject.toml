@@ -32,6 +32,9 @@ model = [
 flashinfer = [
   "flashinfer-python>=0.2",
 ]
+flashattn = [
+  "flash-attn>=2.6",
+]
 
 [project.scripts]
 solort-api = "solort.api.server:main"

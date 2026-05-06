@@ -89,6 +89,8 @@ class InteractiveScheduler:
         return candidates[0]
 
     def _effective_priority(self, sequence: Sequence) -> SchedulerPriority:
+        # Decode gets first claim on the GPU because interactive smoothness is governed by the
+        # gap between streamed tokens, not aggregate prompt throughput.
         if sequence.task_kind == TaskKind.CACHE_MAINTENANCE:
             return SchedulerPriority.CACHE_MAINTENANCE
         if sequence.is_prefill_complete:

@@ -5,6 +5,8 @@ from fastapi.testclient import TestClient
 
 pytest.importorskip("httpx")
 
+from tests.fakes import DeterministicExecutor
+
 from solort.api.server import create_app
 from solort.api.streaming import sse_event
 from solort.core.runtime import RuntimeCore
@@ -12,7 +14,7 @@ from solort.core.session import Message
 
 
 def test_non_streaming_chat_completion_endpoint() -> None:
-    client = TestClient(create_app(RuntimeCore()))
+    client = TestClient(create_app(RuntimeCore(executor=DeterministicExecutor())))
 
     response = client.post(
         "/v1/chat/completions",
@@ -31,7 +33,7 @@ def test_non_streaming_chat_completion_endpoint() -> None:
 
 
 def test_streaming_chat_completion_endpoint() -> None:
-    client = TestClient(create_app(RuntimeCore()))
+    client = TestClient(create_app(RuntimeCore(executor=DeterministicExecutor())))
 
     with client.stream(
         "POST",
@@ -59,9 +61,9 @@ def test_sse_event_preserves_utf8_text() -> None:
 
 
 def test_cancel_endpoint() -> None:
-    runtime = RuntimeCore()
+    runtime = RuntimeCore(executor=DeterministicExecutor())
     sequence = runtime.add_request(
-        model_id="mock",
+        model_id="test",
         messages=[Message(role="user", content="cancel through api")],
         max_new_tokens=4,
     )
@@ -74,7 +76,7 @@ def test_cancel_endpoint() -> None:
 
 
 def test_metrics_endpoint_reflects_completed_request() -> None:
-    client = TestClient(create_app(RuntimeCore()))
+    client = TestClient(create_app(RuntimeCore(executor=DeterministicExecutor())))
     client.post(
         "/v1/chat/completions",
         json={

@@ -6,12 +6,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
-from solort.backends.attention_base import AttentionBackend
-from solort.backends.eager_backend import EagerAttentionBackend
 from solort.core.batch import Batch
 from solort.core.sequence import Sequence
 from solort.core.session import Message
-from solort.model.sampler import MockSampler, Sampler, SampleResult
+from solort.model.sampler import SampleResult
 
 
 class ModelExecutor(Protocol):
@@ -24,36 +22,9 @@ class ModelExecutor(Protocol):
         """Run one decode step and return one or more sampled tokens."""
 
 
-class MockModelExecutor:
-    """Executor that simulates prefill/decode without model weights."""
-
-    name = "mock"
-    supports_prefix_cache = True
-
-    def __init__(
-        self,
-        attention_backend: AttentionBackend | None = None,
-        sampler: Sampler | None = None,
-    ) -> None:
-        self.attention_backend = attention_backend or EagerAttentionBackend()
-        self.sampler = sampler or MockSampler()
-        self.prefill_steps = 0
-        self.decode_steps = 0
-
-    def forward_prefill(self, batch: Batch) -> None:
-        self.prefill_steps += 1
-        self.attention_backend.prepare_metadata(batch)
-
-    def forward_decode(self, batch: Batch) -> SampleResult:
-        self.decode_steps += 1
-        self.attention_backend.prepare_metadata(batch)
-        sequence = batch.seqs[0]
-        return self.sampler.sample(logits=None, sequence=sequence)
-
-
 @dataclass
 class TransformersGenerationConfig:
-    model_id: str = "Qwen/Qwen3-0.6B"
+    model_id: str = "Qwen/Qwen3-4B"
     device_map: str = "auto"
     torch_dtype: str = "auto"
     enable_thinking: bool = False
@@ -63,9 +34,10 @@ class TransformersGenerationConfig:
     default_top_k: int = 20
     default_repetition_penalty: float = 1.08
     default_max_repeated_token_run: int = 16
-    speculative_draft_model_id: str | None = None
-    speculative_tokens: int = 0
+    speculative_draft_model_id: str | None = "Qwen/Qwen3-0.6B"
+    speculative_tokens: int = 4
     speculative_draft_device_map: str | None = None
+    attention_backend: str = "auto"
 
 
 @dataclass
@@ -82,9 +54,9 @@ class _ServingState:
 class TransformersTextExecutor:
     """Hugging Face executor with explicit prefill and one-token decode.
 
-    This is still the simple real-model path, not the future paged-attention kernel path. It uses
-    Hugging Face `past_key_values` as the cache boundary so the API and scheduler exercise real
-    prefill/decode phases without downloading a heavyweight serving stack.
+    This is the compatibility bridge. It uses Hugging Face `past_key_values` internally while the
+    SoloRT scheduler, page tables, metrics, and streaming API exercise the same phase boundaries as
+    the paged runtime.
     """
 
     name = "transformers"
@@ -95,6 +67,7 @@ class TransformersTextExecutor:
         self._states: dict[str, _ServingState] = {}
         self.speculative_proposed_tokens = 0
         self.speculative_accepted_tokens = 0
+        self.speculative_rejected_tokens = 0
 
         try:
             import torch
@@ -137,12 +110,15 @@ class TransformersTextExecutor:
             else None
         )
         return {
+            "attention_backend": self.config.attention_backend,
             "speculative_enabled": self.draft_model is not None,
             "speculative_draft_model_id": self.config.speculative_draft_model_id,
             "speculative_tokens": self.config.speculative_tokens,
             "speculative_proposed_tokens": self.speculative_proposed_tokens,
             "speculative_accepted_tokens": self.speculative_accepted_tokens,
+            "speculative_rejected_tokens": self.speculative_rejected_tokens,
             "speculative_acceptance_rate": acceptance_rate,
+            **self._attention_backend_snapshot(),
         }
 
     def tokenize_messages(
@@ -283,9 +259,13 @@ class TransformersTextExecutor:
 
         self.speculative_proposed_tokens += len(draft_tokens)
         self.speculative_accepted_tokens += accepted
+        self.speculative_rejected_tokens += len(draft_tokens) - accepted
 
         results: list[SampleResult] = []
         if accepted == len(draft_tokens):
+            # Full acceptance can keep the target forward pass cache because it already contains
+            # every draft token. The extra recovery token is emitted but not cached until the next
+            # one-token decode step, matching the non-speculative path.
             state.past_key_values = validate_outputs.past_key_values
             for token_id in draft_tokens:
                 results.append(self._append_token_result(sequence, state, token_id))
@@ -298,6 +278,8 @@ class TransformersTextExecutor:
             return results
 
         accepted_prefix = draft_tokens[:accepted]
+        # Partial rejection is transactional: roll back the target cache to the original prefix,
+        # replay only accepted draft tokens, then emit the target correction token.
         state.past_key_values = original_past
         prefix_outputs = self._target_forward_from_state(
             state,
@@ -501,6 +483,18 @@ class TransformersTextExecutor:
 
     def _model_kwargs(self) -> dict[str, object]:
         kwargs: dict[str, object] = {}
+        attention_backend = self.config.attention_backend.strip().lower()
+        if attention_backend == "flashinfer":
+            from solort.backends.transformers_flashinfer import (
+                ATTENTION_NAME,
+                register_solort_flashinfer_attention,
+            )
+
+            register_solort_flashinfer_attention()
+            kwargs["attn_implementation"] = ATTENTION_NAME
+        elif attention_backend in {"eager", "sdpa", "flash_attention_2", "flex_attention"}:
+            kwargs["attn_implementation"] = attention_backend
+
         if self.config.torch_dtype != "auto":
             kwargs["dtype"] = getattr(self._torch, self.config.torch_dtype)
         else:
@@ -508,6 +502,15 @@ class TransformersTextExecutor:
         if self.config.device_map != "cpu":
             kwargs["device_map"] = self.config.device_map
         return kwargs
+
+    def _attention_backend_snapshot(self) -> dict[str, object]:
+        if self.config.attention_backend.strip().lower() != "flashinfer":
+            return {}
+        try:
+            from solort.backends.transformers_flashinfer import flashinfer_attention_snapshot
+        except ImportError:
+            return {}
+        return flashinfer_attention_snapshot()
 
     def _load_draft_model(self) -> object | None:
         if not self.config.speculative_draft_model_id or self.config.speculative_tokens <= 0:
@@ -548,6 +551,31 @@ class QwenTransformersExecutor(TransformersTextExecutor):
 
     def __init__(self) -> None:
         super().__init__(TransformersGenerationConfig(model_id="Qwen/Qwen3-0.6B"))
+
+
+class PagedQwenExecutor(TransformersTextExecutor):
+    """Qwen serving bridge configured like the paged runtime.
+
+    The class is intentionally explicit about being a bridge: SoloRT now builds real page metadata
+    and KV transactions outside the executor, while this path still delegates layer execution to
+    Transformers until the custom Qwen layer runner lands.
+    """
+
+    name = "paged-qwen-transformers-bridge"
+    supports_prefix_cache = False
+
+    def snapshot(self) -> dict[str, object]:
+        data = super().snapshot()
+        data.update(
+            {
+                "target_model_id": self.config.model_id,
+                "cache_boundary": "solort-page-metadata + hf-past-key-values",
+                "paged_executor_status": (
+                    "FlashInfer HF attention bridge enabled; tensor-backed paged runner pending"
+                ),
+            }
+        )
+        return data
 
 
 def messages_to_metadata(messages: Iterable[Message]) -> list[dict[str, str]]:
