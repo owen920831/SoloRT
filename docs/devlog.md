@@ -47,6 +47,27 @@ Plan (iterative, measure every step against the vLLM baseline):
 
 ## Log
 
+### 2026-06-26 — torch.compile on HF Qwen3 is a dead end; custom runner required
+
+Tested torch.compile every way to get CUDA graphs onto the HF model:
+- torch 2.4 (NGC): reduce-overhead recompile-thrashes -> 0.6 tok/s.
+- torch 2.6 (cu124) + transformers latest: `NameError` in transformers `output_capturing.py` under
+  dynamo (a transformers+compile bug).
+- torch 2.6 + transformers==4.51.3 (no error), all modes SLOWER than eager: reduce-overhead 5.1,
+  default 3.8, max-autotune-no-cudagraphs 4.0 tok/s vs eager ~15-27.
+
+Root cause: HF's modeling code is data-dependent (`.item()` on `cache_position`, dynamic mask
+build), so dynamo guards on the changing position and re-captures/recompiles every decode step.
+The same data-dependence would bake the write position into a hand-captured `torch.cuda.CUDAGraph`,
+so manual capture of the HF forward fails too.
+
+**Conclusion:** vLLM/nano-vllm are fast because they run their OWN graph-friendly model
+implementation (static shapes, position read from a buffer, paged-attention kernel) and CUDA-graph
+it. To match/beat vLLM, SoloRT needs the same: a custom Qwen3 decode forward (the Phase 3/4
+tensor-backed paged executor), not the HF bridge. Reverted the `use_compile` experiment (disproven).
+This is the next build; first milestone = a custom decode forward whose logits match HF for one
+step, then paged attention + manual CUDA-graph capture.
+
 ### 2026-06-26 — Toward beating vLLM: diagnosis + StaticCache groundwork
 
 Goal: beat vLLM single-stream for Qwen3 on one 4080, finish the fast Qwen path, keep iterating.
