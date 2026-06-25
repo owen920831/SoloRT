@@ -51,8 +51,3 @@ class CancelRequest(BaseModel):
         if self.request_id is None and self.session_id is None:
             raise ValueError("request_id or session_id is required")
         return self
-
-
-class NotImplementedPayload(BaseModel):
-    error: str
-    detail: str

@@ -8,7 +8,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator, Iterable
 
-from solort.cache.kv_cache import KVCacheConfig, KVCacheMetadata, PagedKVCache
+from solort.cache.kv_cache import KVCacheConfig, PagedKVCache
 from solort.cache.prefix_cache import PrefixCache, PrefixMatch
 from solort.cache.vram_manager import VRAMBudgetManager
 from solort.core.batch import Batch
@@ -56,7 +56,6 @@ class RuntimeCore:
         self.metrics = metrics or RuntimeMetrics()
         self.vram_manager = vram_manager or VRAMBudgetManager()
         self._active_by_session: dict[str, str] = {}
-        self._prefix_entries_by_seq: dict[str, object] = {}
 
     def add_request(
         self,
@@ -203,7 +202,6 @@ class RuntimeCore:
                     pinned=True,
                 )
                 sequence.cache_handle = entry
-                self._prefix_entries_by_seq[sequence.seq_id] = entry
             return []
 
         total_tokens_after_decode = sequence.num_prompt_tokens + len(sequence.output_ids) + 1
@@ -269,7 +267,7 @@ class RuntimeCore:
             return sample_or_samples
         raise TypeError("executor.forward_decode must return SampleResult or list[SampleResult]")
 
-    def _attach_kv_metadata(self, batch: Batch, *, token_count: int) -> KVCacheMetadata:
+    def _attach_kv_metadata(self, batch: Batch, *, token_count: int) -> None:
         sequence = batch.seqs[0]
         # These four fields are the handoff contract between scheduling/cache policy and attention:
         # logical positions are mapped to physical KV slots, while page arrays describe each
@@ -283,7 +281,6 @@ class RuntimeCore:
         batch.page_indices = metadata.page_indices
         batch.last_page_len = metadata.last_page_len
         batch.slot_mapping = metadata.slot_mapping
-        return metadata
 
     def _executor_snapshot(self) -> dict[str, object]:
         snapshot = getattr(self.executor, "snapshot", None)
@@ -322,41 +319,30 @@ class RuntimeCore:
 def build_default_runtime() -> RuntimeCore:
     executor_name = os.getenv("SOLORT_EXECUTOR", "paged").strip().lower()
     if executor_name in {"paged", "paged-qwen", "qwen-paged"}:
-        executor = PagedQwenExecutor(
-            TransformersGenerationConfig(
-                model_id=os.getenv("SOLORT_MODEL_ID", "Qwen/Qwen3-4B"),
-                device_map=os.getenv("SOLORT_DEVICE_MAP", "auto"),
-                torch_dtype=os.getenv("SOLORT_TORCH_DTYPE", "auto"),
-                enable_thinking=_env_bool("SOLORT_ENABLE_THINKING", default=False),
-                trust_remote_code=_env_bool("SOLORT_TRUST_REMOTE_CODE", default=False),
-                speculative_draft_model_id=os.getenv(
-                    "SOLORT_SPECULATIVE_DRAFT_MODEL_ID",
-                    "Qwen/Qwen3-0.6B",
-                ),
-                speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=0),
-                speculative_draft_device_map=os.getenv("SOLORT_SPECULATIVE_DRAFT_DEVICE_MAP"),
-                attention_backend=os.getenv("SOLORT_ATTENTION_BACKEND", "flashinfer"),
-            )
-        )
+        executor_cls: type[ModelExecutor] = PagedQwenExecutor
+        default_backend = "flashinfer"
     elif executor_name in {"transformers", "hf", "qwen"}:
-        executor: ModelExecutor = TransformersTextExecutor(
-            TransformersGenerationConfig(
-                model_id=os.getenv("SOLORT_MODEL_ID", "Qwen/Qwen3-4B"),
-                device_map=os.getenv("SOLORT_DEVICE_MAP", "auto"),
-                torch_dtype=os.getenv("SOLORT_TORCH_DTYPE", "auto"),
-                enable_thinking=_env_bool("SOLORT_ENABLE_THINKING", default=False),
-                trust_remote_code=_env_bool("SOLORT_TRUST_REMOTE_CODE", default=False),
-                speculative_draft_model_id=os.getenv(
-                    "SOLORT_SPECULATIVE_DRAFT_MODEL_ID",
-                    "Qwen/Qwen3-0.6B",
-                ),
-                speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=0),
-                speculative_draft_device_map=os.getenv("SOLORT_SPECULATIVE_DRAFT_DEVICE_MAP"),
-                attention_backend=os.getenv("SOLORT_ATTENTION_BACKEND", "auto"),
-            )
-        )
+        executor_cls = TransformersTextExecutor
+        default_backend = "auto"
     else:
         raise ValueError(f"unknown SOLORT_EXECUTOR={executor_name!r}")
+
+    executor = executor_cls(
+        TransformersGenerationConfig(
+            model_id=os.getenv("SOLORT_MODEL_ID", "Qwen/Qwen3-4B"),
+            device_map=os.getenv("SOLORT_DEVICE_MAP", "auto"),
+            torch_dtype=os.getenv("SOLORT_TORCH_DTYPE", "auto"),
+            enable_thinking=_env_bool("SOLORT_ENABLE_THINKING", default=False),
+            trust_remote_code=_env_bool("SOLORT_TRUST_REMOTE_CODE", default=False),
+            speculative_draft_model_id=os.getenv(
+                "SOLORT_SPECULATIVE_DRAFT_MODEL_ID",
+                "Qwen/Qwen3-0.6B",
+            ),
+            speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=0),
+            speculative_draft_device_map=os.getenv("SOLORT_SPECULATIVE_DRAFT_DEVICE_MAP"),
+            attention_backend=os.getenv("SOLORT_ATTENTION_BACKEND", default_backend),
+        )
+    )
     kv_cache = _build_runtime_kv_cache(executor)
     return RuntimeCore(executor=executor, kv_cache=kv_cache)
 

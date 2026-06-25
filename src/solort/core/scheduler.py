@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 
 from solort.core.batch import Batch, BatchBuilder
 from solort.core.sequence import (
@@ -13,13 +12,6 @@ from solort.core.sequence import (
     SequenceStatus,
     TaskKind,
 )
-
-
-@dataclass
-class SchedulerSnapshot:
-    waiting_sequences: int
-    running_sequences: int
-    finished_sequences: int
 
 
 class InteractiveScheduler:

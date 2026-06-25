@@ -19,7 +19,6 @@ class Batch:
     page_indptr: list[int] | None = None
     page_indices: list[int] | None = None
     last_page_len: list[int] | None = None
-    padded_batch_size: int | None = None
 
 
 class BatchBuilder:

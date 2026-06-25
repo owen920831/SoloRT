@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -642,8 +643,6 @@ class TransformersTextExecutor:
             return next(self.model.parameters()).device
 
     def _draft_device(self) -> object:
-        if self.draft_model is None:
-            return self._model_device()
         try:
             return self.draft_model.device
         except AttributeError:
@@ -675,7 +674,7 @@ class TransformersTextExecutor:
 
     def _kv_write_context(self, batch_or_slots: Batch | list[int] | None) -> object:
         if self.config.attention_backend.strip().lower() != "flashinfer":
-            return _null_context()
+            return nullcontext()
         from solort.backends.transformers_flashinfer import solort_kv_write_context
 
         slot_mapping = (
@@ -847,12 +846,3 @@ def _dtype_name(dtype: object | None) -> str:
     if text == "float32":
         return "fp32"
     return text
-
-
-class _null_context:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, *args: object) -> bool:
-        del args
-        return False

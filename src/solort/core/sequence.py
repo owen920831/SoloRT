@@ -11,7 +11,6 @@ class SequenceStatus(str, Enum):
     WAITING = "WAITING"
     RUNNING = "RUNNING"
     FINISHED = "FINISHED"
-    PAUSED = "PAUSED"
     CANCELLED = "CANCELLED"
 
 

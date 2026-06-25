@@ -30,7 +30,7 @@ def content_from_sse_payload(payload: str) -> str | None:
     if payload == "[DONE]":
         return None
     event = json.loads(payload)
-    choices = event.get("choices") or []
+    choices = event.get("choices")
     if not choices:
         return None
     content = choices[0].get("delta", {}).get("content")

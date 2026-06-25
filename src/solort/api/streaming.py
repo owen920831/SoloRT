@@ -25,36 +25,20 @@ async def chat_completion_events(
     model: str,
 ) -> AsyncIterator[str]:
     created = int(time.time())
-    async for token_text in runtime.stream_request(sequence):
-        yield sse_event(
+
+    def chunk(delta: dict[str, object], finish_reason: str | None) -> str:
+        return sse_event(
             {
                 "id": sequence.seq_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": token_text},
-                        "finish_reason": None,
-                    }
-                ],
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
             }
         )
 
-    yield sse_event(
-        {
-            "id": sequence.seq_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
-    )
+    async for token_text in runtime.stream_request(sequence):
+        yield chunk({"content": token_text}, None)
+
+    yield chunk({}, "stop")
     yield sse_event("[DONE]")

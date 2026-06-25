@@ -62,13 +62,14 @@ class RuntimeMetrics:
             ]
             tpots.extend(gaps)
 
+        avg_tpot = sum(tpots) / len(tpots) if tpots else None
         return {
             "requests_started": self.requests_started,
             "requests_finished": self.requests_finished,
             "tokens_generated": self.tokens_generated,
             "avg_ttft_seconds": sum(ttfts) / len(ttfts) if ttfts else None,
-            "avg_tpot_seconds": sum(tpots) / len(tpots) if tpots else None,
-            "avg_itl_seconds": sum(tpots) / len(tpots) if tpots else None,
+            "avg_tpot_seconds": avg_tpot,
+            "avg_itl_seconds": avg_tpot,
             "avg_ttot_seconds": sum(ttots) / len(ttots) if ttots else None,
             "overall_tps": (
                 self.tokens_generated / sum(ttots)

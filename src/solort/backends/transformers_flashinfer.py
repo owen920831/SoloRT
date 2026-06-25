@@ -92,11 +92,11 @@ def solort_flashinfer_attention_forward(
     window_left = int(sliding_window) if sliding_window else -1
     _mirror_to_solort_kv(module, key, value)
 
+    decode_fn, prefill_fn = _flashinfer_attention_fns()
+
     if q.shape[0] == 1:
-        decode_fn, _ = _flashinfer_attention_fns()
         if decode_fn is not None:
             try:
-                _STATS.decode_calls += 1
                 output = decode_fn(
                     q[0],
                     k,
@@ -105,15 +105,14 @@ def solort_flashinfer_attention_forward(
                     window_left=window_left,
                     sm_scale=float(scaling),
                 )
+                _STATS.decode_calls += 1
                 return output.unsqueeze(0).unsqueeze(0), None
             except Exception:
-                _STATS.decode_calls -= 1
+                pass
         return _torch_attention_fallback(query, key, value, scaling, causal=False), None
 
-    _, prefill_fn = _flashinfer_attention_fns()
     if prefill_fn is not None:
         try:
-            _STATS.prefill_calls += 1
             output = prefill_fn(
                 q,
                 k,
@@ -123,9 +122,10 @@ def solort_flashinfer_attention_forward(
                 window_left=window_left,
                 sm_scale=float(scaling),
             )
+            _STATS.prefill_calls += 1
             return output.unsqueeze(0), None
         except Exception:
-            _STATS.prefill_calls -= 1
+            pass
     return _torch_attention_fallback(query, key, value, scaling, causal=True), None
 
 
