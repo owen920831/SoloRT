@@ -52,6 +52,8 @@ class TransformersGenerationConfig:
     # is OFF by default. It is kept as the precondition for CUDA-graph capture (fixed-shape KV),
     # which is the real lever. Incompatible with the FlashInfer bridge and speculative decoding.
     use_static_cache: bool = False
+    # Max sequence length (prompt + generation) for the CUDA-graph executor's static KV buffers.
+    graph_max_len: int = 2048
 
 
 @dataclass

@@ -1,5 +1,25 @@
 # Benchmark records
 
+## 2026-06-26 — CUDA-graph custom Qwen3 executor BEATS vLLM on 0.6B
+
+`SOLORT_EXECUTOR=cudagraph`: a hand-written, graph-friendly Qwen3 forward over SoloRT-owned static
+KV (position read from a buffer, masked attention), with the single-token decode step captured once
+into a CUDA graph and replayed per token. Single-stream, temp=0, through the full SoloRT server.
+
+| model      | SoloRT cudagraph | vLLM v0.8.5 | SoloRT/vLLM | vs old SoloRT (~12 tps) |
+| ---------- | ---------------- | ----------- | ----------- | ----------------------- |
+| Qwen3-0.6B | 108.9 tps        | 91.1 tps    | **1.19x**   | 9.1x                    |
+| Qwen3-4B   | 42.9 tps         | 55.6 tps    | 0.77x       | 3.9x                    |
+
+**We beat vLLM single-stream decode on 0.6B (1.19x) and reach 0.77x on 4B** (3.9x over the old HF
+path). Isolated micro-benchmark (no server) hit 131.9 tps on 0.6B (eager-custom 27.4) — CUDA graphs
+are the lever, exactly as predicted from the launch-bound diagnosis.
+
+TTFT is higher than vLLM (0.6B 64ms vs 22ms) because prefill is not yet graph/kernel-optimized.
+The 4B decode gap is kernel efficiency: the decode attention scans the full graph_max_len and
+materializes fp32 scores, vs vLLM's FlashAttention. Next: attend only to the live length / paged
+decode kernel, fuse ops, optimize prefill.
+
 ## 2026-06-26 — vLLM baseline (the target to beat) + StaticCache probe
 
 Single-stream, temp=0, 200 tokens, RTX 4080 16 GB, same prompt. vLLM v0.8.5.post1 (CUDA 12.4 —
