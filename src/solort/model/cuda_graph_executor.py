@@ -81,7 +81,6 @@ class _GraphQwen3Runner:
         t = int(ids.shape[0])
         cos, sin = self._cos_sin(torch.arange(t, device=self.dev))
         x = self.embed[ids].to(self.dt)
-        causal = torch.triu(torch.full((t, t), float("-inf"), device=self.dev), 1)
         for li, ly in enumerate(self.layers):
             h = _rmsnorm(x, ly["in_ln"], self.eps)
             q = (h @ ly["wq"].T).view(t, self.nh, self.hd).transpose(0, 1)
@@ -93,9 +92,11 @@ class _GraphQwen3Runner:
             self.vc[li, :t] = v.transpose(0, 1)
             kk = k.repeat_interleave(self.groups, 0)
             vv = v.repeat_interleave(self.groups, 0)
-            sc = (q.float() @ kk.float().transpose(-1, -2)) * self.scale + causal
-            attn = torch.softmax(sc, -1).to(self.dt)
-            ctx = (attn @ vv).transpose(0, 1).reshape(t, self.nh * self.hd)
+            ctx = (
+                F.scaled_dot_product_attention(q, kk, vv, is_causal=True, scale=self.scale)
+                .transpose(0, 1)
+                .reshape(t, self.nh * self.hd)
+            )
             x = x + ctx @ ly["wo"].T
             h2 = _rmsnorm(x, ly["post_ln"], self.eps)
             x = x + (F.silu(h2 @ ly["wg"].T) * (h2 @ ly["wu"].T)) @ ly["wd"].T
@@ -105,7 +106,7 @@ class _GraphQwen3Runner:
     def _decode_forward(self) -> torch.Tensor:
         cos, sin = self._cos_sin(self.pos_buf)
         x = self.embed[self.tok_buf].to(self.dt)
-        mask = (self.arange > self.pos_buf).view(1, 1, self.max_len)
+        keep = (self.arange <= self.pos_buf).view(1, 1, self.max_len)  # True = attend (read at replay)
         for li, ly in enumerate(self.layers):
             h = _rmsnorm(x, ly["in_ln"], self.eps)
             q = (h @ ly["wq"].T).view(1, self.nh, self.hd).transpose(0, 1)
@@ -117,10 +118,11 @@ class _GraphQwen3Runner:
             self.vc[li].index_copy_(0, self.pos_buf, v.transpose(0, 1))
             kk = self.kc[li].permute(1, 0, 2).repeat_interleave(self.groups, 0)
             vv = self.vc[li].permute(1, 0, 2).repeat_interleave(self.groups, 0)
-            sc = (q.float() @ kk.float().transpose(-1, -2)) * self.scale
-            sc = sc.masked_fill(mask, float("-inf"))
-            attn = torch.softmax(sc, -1).to(self.dt)
-            ctx = (attn @ vv).transpose(0, 1).reshape(1, self.nh * self.hd)
+            ctx = (
+                F.scaled_dot_product_attention(q, kk, vv, attn_mask=keep, scale=self.scale)
+                .transpose(0, 1)
+                .reshape(1, self.nh * self.hd)
+            )
             x = x + ctx @ ly["wo"].T
             h2 = _rmsnorm(x, ly["post_ln"], self.eps)
             x = x + (F.silu(h2 @ ly["wg"].T) * (h2 @ ly["wu"].T)) @ ly["wd"].T

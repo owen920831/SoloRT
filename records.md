@@ -6,10 +6,14 @@
 KV (position read from a buffer, masked attention), with the single-token decode step captured once
 into a CUDA graph and replayed per token. Single-stream, temp=0, through the full SoloRT server.
 
-| model      | SoloRT cudagraph | vLLM v0.8.5 | SoloRT/vLLM | vs old SoloRT (~12 tps) |
-| ---------- | ---------------- | ----------- | ----------- | ----------------------- |
-| Qwen3-0.6B | 108.9 tps        | 91.1 tps    | **1.19x**   | 9.1x                    |
-| Qwen3-4B   | 42.9 tps         | 55.6 tps    | 0.77x       | 3.9x                    |
+| model      | SoloRT cudagraph (SDPA) | vLLM v0.8.5 | SoloRT/vLLM | vs old SoloRT (~12 tps) |
+| ---------- | ----------------------- | ----------- | ----------- | ----------------------- |
+| Qwen3-0.6B | 157.7 tps               | 91.1 tps    | **1.73x**   | 13x                     |
+| Qwen3-4B   | 44.5 tps                | 55.6 tps    | 0.80x       | 4.0x                    |
+
+(Manual fp32-score attention -> `F.scaled_dot_product_attention` flash kernel lifted 0.6B from
+108.9 to 157.7 tps. 4B barely moved: it still scans the full graph_max_len each step and the big
+unfused projection GEMMs dominate.)
 
 **We beat vLLM single-stream decode on 0.6B (1.19x) and reach 0.77x on 4B** (3.9x over the old HF
 path). Isolated micro-benchmark (no server) hit 131.9 tps on 0.6B (eager-custom 27.4) — CUDA graphs
