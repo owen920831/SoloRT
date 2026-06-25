@@ -25,12 +25,22 @@ GPU experiments while the card is idle.
    (`use_cache=False`), so proposing K tokens costs ~K x prefix_len. This is why speculative
    decoding shows ~no speedup (spec 12.15 vs nospec 12.13 tps). Give the draft model an
    incremental KV cache so a proposal round costs ~accepted tokens, not the whole prefix.
-2. KV-mirror numerical validation — confirm the mirrored per-layer paged tensor matches HF
-   `past_key_values` so the tensor-backed paged runner can later trust it.
+2. KV-mirror numerical validation — (read path DONE: `gather_layer_tokens` + store/gather
+   round-trip test). Remaining: GPU check that mirrored paged K/V matches HF `past_key_values`.
 3. Tensor-backed paged executor — replace the HF `past_key_values` bridge with a Qwen layer
-   runner that reads/writes SoloRT pages directly (the long-term Phase 3 milestone).
+   runner that reads/writes SoloRT pages directly (the long-term Phase 3 milestone). IN PROGRESS.
 
 ## Log
+
+### 2026-06-25 — Paged executor step 1: KV read path + store/gather round-trip
+
+Toward the tensor-backed paged executor (one attention path for generate + validate). Added
+`PagedKVCache.gather_layer_tokens` — the read counterpart to `store_layer_tokens` — returning paged
+K/V in NHD `[tokens, heads, head_dim]` via a single `index_select` (slot == flat `[pages, page]`
+index). A torch round-trip test proves `gather(store(x)) == x` and per-layer isolation. This is the
+contract the paged executor needs: it can feed attention from SoloRT-owned KV instead of HF
+`past_key_values`. Next: wire a forward that reads from the paged tensor and compare logits against
+the HF path on GPU, then replace the `past_key_values` bridge layer by layer.
 
 ### 2026-06-25 — Decision: speculation off by default + fix SDPA fallback
 

@@ -234,6 +234,27 @@ class PagedKVCache:
             self.v_cache[layer_idx, page_id, page_offset].copy_(v_tokens[token_index])
             self.mirrored_tokens += 1
 
+    def gather_layer_tokens(self, *, layer_idx: int, slot_mapping: list[int]) -> tuple[Any, Any]:
+        """Read paged K/V for the given physical slots in NHD layout `[tokens, heads, head_dim]`.
+
+        The read counterpart to `store_layer_tokens`: the tensor-backed paged executor will use
+        this to feed attention directly from SoloRT-owned KV instead of HF `past_key_values`.
+        A physical slot equals `page_id * page_size + page_offset`, which is exactly the flattened
+        index into the `[num_pages, page_size]` grid, so the gather is a single index_select.
+        """
+
+        if not self.has_tensors:
+            raise RuntimeError("gather_layer_tokens requires allocated KV tensors")
+        if layer_idx < 0 or layer_idx >= self.config.num_layers:
+            raise ValueError(f"layer_idx {layer_idx} out of range [0, {self.config.num_layers})")
+
+        import torch
+
+        flat_k = self.k_cache[layer_idx].reshape(-1, self.config.num_kv_heads, self.config.head_dim)
+        flat_v = self.v_cache[layer_idx].reshape(-1, self.config.num_kv_heads, self.config.head_dim)
+        index = torch.as_tensor(slot_mapping, dtype=torch.long, device=flat_k.device)
+        return flat_k.index_select(0, index).clone(), flat_v.index_select(0, index).clone()
+
     def snapshot(self) -> dict[str, int | str]:
         allocator = self.allocator.snapshot()
         return {

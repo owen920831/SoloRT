@@ -80,3 +80,35 @@ def test_tensor_backed_kv_cache_mirrors_layer_tokens() -> None:
     assert torch.equal(cache.k_cache[1, 0, 0], key[0, :, 0, :])
     assert torch.equal(cache.k_cache[1, 0, 1], key[0, :, 1, :])
     assert torch.equal(cache.v_cache[1, 1, 1], value[0, :, 2, :])
+
+
+def test_tensor_backed_kv_cache_gather_round_trips_store() -> None:
+    torch = pytest.importorskip("torch")
+    cache = PagedKVCache(
+        KVCacheConfig(
+            num_layers=2,
+            num_pages=2,
+            page_size=4,
+            num_kv_heads=2,
+            head_dim=4,
+            dtype="fp32",
+            device="cpu",
+            allocate_tensors=True,
+        )
+    )
+    key = torch.arange(1 * 2 * 3 * 4, dtype=torch.float32).reshape(1, 2, 3, 4)
+    value = key + 100
+    slots = [0, 1, 5]
+
+    cache.store_layer_tokens(layer_idx=1, slot_mapping=slots, key=key, value=value)
+    cache.store_layer_tokens(layer_idx=0, slot_mapping=slots, key=key + 200, value=value + 200)
+    k_out, v_out = cache.gather_layer_tokens(layer_idx=1, slot_mapping=slots)
+
+    # gather is the inverse of store: NHD [tokens, heads, head_dim] == HF key[0] with heads/tokens
+    # transposed. This round-trip is the contract the paged executor relies on.
+    assert torch.equal(k_out, key[0].transpose(0, 1))
+    assert torch.equal(v_out, value[0].transpose(0, 1))
+    # Per-layer isolation: layer 0 holds its own distinct data at the same slots.
+    k_layer0, _ = cache.gather_layer_tokens(layer_idx=0, slot_mapping=slots)
+    assert torch.equal(k_layer0, (key + 200)[0].transpose(0, 1))
+    assert not torch.equal(k_layer0, k_out)
