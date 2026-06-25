@@ -32,6 +32,21 @@ GPU experiments while the card is idle.
 
 ## Log
 
+### 2026-06-25 — Enable other LLMs
+
+The runtime was already model-agnostic (target picked via `SOLORT_MODEL_ID`; the paged KV layout
+is derived from `model.config`). The gaps were guardrails + ergonomics, not architecture:
+
+- **Vocab guard**: greedy speculative decoding compares draft/target token ids directly, so a
+  mismatched draft pair would emit silently wrong tokens. `_load_draft_model` now disables
+  speculation (with a logged warning) when draft and target `vocab_size` differ.
+- **Generic Make target**: `make docker-ngc-up-model MODEL=... DRAFT_MODEL=... SPEC_TOKENS=...
+  ATTENTION_BACKEND=...` serves any HF causal LM without remembering Qwen-named vars.
+- **Prefetch** honors the generic `MODEL`/`DRAFT_MODEL` knobs and skips empty entries.
+- **README** "Running Other Models": env-var table + constraints (shared-vocab requirement for
+  speculation; use `ATTENTION_BACKEND=sdpa` for Gemma2 soft-capping / DeepSeek MLA that the
+  FlashInfer bridge does not model exactly).
+
 ### 2026-06-25 — P1: draft KV cache (in progress)
 
 - Reviewed the runtime end to end; confirmed the WIP (KV mirror + FlashInfer torch fallback +

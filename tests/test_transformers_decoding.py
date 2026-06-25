@@ -150,6 +150,25 @@ def test_draft_cache_reuses_prefix_across_rounds() -> None:
     assert state.draft_cached_len == 7
 
 
+def _vocab_executor(target_vocab: int) -> TransformersTextExecutor:
+    executor = TransformersTextExecutor.__new__(TransformersTextExecutor)
+    executor.config = TransformersGenerationConfig()
+    executor.model = types.SimpleNamespace(config=types.SimpleNamespace(vocab_size=target_vocab))
+    return executor
+
+
+def test_draft_vocab_guard_accepts_matching_vocab() -> None:
+    executor = _vocab_executor(151_936)
+    draft = types.SimpleNamespace(config=types.SimpleNamespace(vocab_size=151_936))
+    assert executor._draft_vocab_compatible(draft) is True
+
+
+def test_draft_vocab_guard_rejects_mismatched_vocab() -> None:
+    executor = _vocab_executor(151_936)
+    draft = types.SimpleNamespace(config=types.SimpleNamespace(vocab_size=32_000))
+    assert executor._draft_vocab_compatible(draft) is False
+
+
 def test_text_delta_uses_simple_suffix_when_text_is_stable() -> None:
     assert _text_delta("你好", "你好 SoloRT") == " SoloRT"
 

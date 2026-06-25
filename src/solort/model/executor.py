@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
@@ -11,6 +12,8 @@ from solort.core.batch import Batch
 from solort.core.sequence import Sequence
 from solort.core.session import Message
 from solort.model.sampler import SampleResult
+
+logger = logging.getLogger(__name__)
 
 
 class ModelExecutor(Protocol):
@@ -749,7 +752,29 @@ class TransformersTextExecutor:
         if draft_device_map == "cpu":
             model.to("cpu")
         model.eval()
+        if not self._draft_vocab_compatible(model):
+            return None
         return model
+
+    def _draft_vocab_compatible(self, draft_model: object) -> bool:
+        """Greedy speculative decoding compares draft and target token ids directly, so the two
+        models must share a vocabulary. A size mismatch means a misconfigured draft pairing that
+        would otherwise emit silently wrong tokens, so disable speculation with a clear warning.
+        """
+
+        target_vocab = getattr(getattr(self.model, "config", None), "vocab_size", None)
+        draft_vocab = getattr(getattr(draft_model, "config", None), "vocab_size", None)
+        if target_vocab is None or draft_vocab is None or int(target_vocab) == int(draft_vocab):
+            return True
+        logger.warning(
+            "Disabling speculative decoding: draft %s vocab_size=%s != target %s vocab_size=%s; "
+            "use a draft model from the same tokenizer family.",
+            self.config.speculative_draft_model_id,
+            draft_vocab,
+            self.config.model_id,
+            target_vocab,
+        )
+        return False
 
 
 class QwenTransformersExecutor(TransformersTextExecutor):

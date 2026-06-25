@@ -141,6 +141,47 @@ References:
 - [Qwen3 collection](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f)
 - [SoloRT architecture notes](docs/architecture.md)
 
+## Running Other Models
+
+SoloRT is model-agnostic: the executor serves whatever Hugging Face causal LM you point it at, and
+the paged KV layout is derived from the model config (layers, KV heads, head dim). Pick models with
+environment variables or the generic Makefile target — no code changes required.
+
+```bash
+# Any HF causal LM as the target, with a same-family speculative draft.
+make docker-ngc-up-model \
+  MODEL=meta-llama/Llama-3.2-3B-Instruct \
+  DRAFT_MODEL=meta-llama/Llama-3.2-1B-Instruct
+
+# Single model, speculation disabled.
+make docker-ngc-up-model MODEL=mistralai/Mistral-7B-Instruct-v0.3 DRAFT_MODEL= SPEC_TOKENS=0
+
+# Architecture the FlashInfer bridge does not model exactly -> let Transformers do attention.
+make docker-ngc-up-model MODEL=google/gemma-2-2b-it DRAFT_MODEL= SPEC_TOKENS=0 ATTENTION_BACKEND=sdpa
+```
+
+The generic knobs map to these environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `SOLORT_MODEL_ID` | Target model repo id. |
+| `SOLORT_SPECULATIVE_DRAFT_MODEL_ID` | Draft model; leave empty to disable speculation. |
+| `SOLORT_SPECULATIVE_TOKENS` | Draft length `K` (`0` disables speculation). |
+| `SOLORT_ATTENTION_BACKEND` | `flashinfer` (default), `sdpa`, `eager`, `flash_attention_2`. |
+| `SOLORT_TRUST_REMOTE_CODE` | Set `1` for models that ship custom modeling code. |
+
+Constraints to know:
+
+- **Speculative decoding needs a shared tokenizer/vocab** between draft and target — SoloRT compares
+  token ids directly. A vocab-size mismatch is detected at load time and speculation is disabled with
+  a warning, so output stays correct. Pair models from one family (Qwen3-4B + Qwen3-0.6B,
+  Llama-3.x 3B + 1B, ...).
+- The FlashInfer bridge implements standard scaled-dot-product attention with GQA and sliding
+  windows. Architectures that need extra attention math (Gemma2 logit soft-capping, DeepSeek MLA)
+  should run with `ATTENTION_BACKEND=sdpa` so Transformers computes attention exactly.
+- VRAM is the practical ceiling: a 16 GB card comfortably runs a ~4B target + ~0.6B draft in fp16.
+- Prefetch weights once with `make docker-hf-prefetch MODEL=... DRAFT_MODEL=...`.
+
 ## Development Checks
 
 Install local development dependencies when working outside Docker:
