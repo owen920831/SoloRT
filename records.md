@@ -1,5 +1,30 @@
 # Benchmark records
 
+## 2026-06-25 — single-stream roofline vs nano-vllm (the real bottleneck)
+
+Single-user, batch-1, temp=0, FlashInfer, spec off, RTX 4080 16 GB, 200 tokens, 4 runs.
+Same prompt for both models.
+
+| model      | decode tps | TTFT  | mem-bw roofline | % of roofline |
+| ---------- | ---------- | ----- | --------------- | ------------- |
+| Qwen3-0.6B | 11.5       | 181 ms | ~600 tps        | ~2%           |
+| Qwen3-4B   | 10.6       | 183 ms | ~90 tps         | ~12%          |
+
+**Decode tps is ~identical across a 7x model-size difference**, and TTFT matches too for a short
+prompt. Decode is therefore **kernel-launch / Python-overhead bound, not compute- or
+bandwidth-bound** — the eager HuggingFace forward + per-layer Python FlashInfer bridge launches
+hundreds of tiny kernels per token with no CUDA graph, so the fixed dispatch cost (~85-90 ms/token)
+dwarfs the actual model math. (TTFT *does* scale with model size for a long prompt: 313 ms for 4B
+vs 181 ms for 0.6B in the earlier run — prefill is compute-bound.)
+
+**vs nano-vllm:** not comparable yet, and not close. nano-vllm (~1.2k LOC) runs its own paged
+attention + CUDA-graph batched execution and reports aggregate *throughput* (hundreds of sequences,
+~1000+ tok/s summed) near vLLM. SoloRT targets single-stream *latency*, but more importantly it
+still executes Qwen through HF Transformers eager mode, so it sits at ~2-12% of the single-stream
+roofline. Closing the gap needs the tensor-backed paged executor (own layer runner + paged
+attention) and CUDA graphs — exactly the standing milestone. Until then, decode speed will stay
+pinned near ~11 tps regardless of model size.
+
 ## 2026-06-25 — spec vs nospec with incremental draft KV cache
 
 Qwen3-4B target, Qwen3-0.6B draft (K=4), FlashInfer, temp=0, 220 max tokens, RTX 4080 16 GB,

@@ -32,6 +32,37 @@ GPU experiments while the card is idle.
 
 ## Log
 
+### 2026-06-26 — Code simplification pass
+
+Ran a fan-out review (one finder per source file) + synthesis; applied the 16 verified-safe,
+behavior-preserving findings (net -32 source lines), all gated by the test suite + lint:
+
+- Dead code removed: `_prefix_entries_by_seq`, `SchedulerSnapshot`, `NotImplementedPayload`,
+  `Sampler` Protocol, `Session.{pinned_prefix_ids,metadata,last_access_ts}`,
+  `SequenceStatus.PAUSED`, `Sequence.kv_precision`, `Batch.padded_batch_size`,
+  hand-rolled `_null_context` (use stdlib `nullcontext`), unreachable `_draft_device` None branch.
+- Dedup: `build_default_runtime` branches (pick class + default backend, build config once),
+  the SSE chunk envelope in `streaming.py`, the FlashInfer fn lookup (call once), and the
+  `avg_tpot`/`avg_itl` computation in metrics.
+- `_attach_kv_metadata` returns None (callers ignored it); FlashInfer counters now count on
+  success instead of increment-then-decrement-on-failure.
+
+Deferred to `consider` (riskier / judgment calls, not applied): deleting unused backend
+scaffolding files (`flashattn_backend.py`, `attention_base.py`, parts of `flashinfer_backend.py`),
+the public `QwenTransformersExecutor`, scheduler `token_budget`/priority-write cleanups, and
+several cache micro-simplifications.
+
+### 2026-06-25 — Single-stream roofline (vs nano-vllm): we are launch-bound
+
+Benchmarked single-stream decode at two model sizes (records.md). Qwen3-0.6B and Qwen3-4B both
+decode at ~11 tps with ~180 ms TTFT for the same prompt — **decode speed is independent of model
+size**, so the runtime is **kernel-launch / Python-overhead bound**, not compute/bandwidth bound
+(~2% of roofline on 0.6B, ~12% on 4B). The eager HF forward + per-layer Python FlashInfer bridge
+launches hundreds of tiny kernels per token with no CUDA graph. So: **not at nano-vllm/vLLM class**
+(they use paged attention + CUDA graphs + batched throughput). The fix is the tensor-backed paged
+executor + CUDA graphs — the standing milestone. Decode tps will stay ~11 regardless of model until
+then.
+
 ### 2026-06-25 — GPU validation of KV mirror + finish the spec-off default
 
 Ran a GPU smoke test (spec off, `KV_TENSOR_STORAGE=1`) on the idle 4080:
