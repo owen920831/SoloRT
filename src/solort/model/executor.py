@@ -46,6 +46,12 @@ class TransformersGenerationConfig:
     speculative_tokens: int = 0
     speculative_draft_device_map: str | None = None
     attention_backend: str = "auto"
+    # Preallocated StaticCache + sdpa for prefill/decode instead of a growing DynamicCache. In an
+    # isolated tight loop this is ~2.3x faster, but through the full serving stack the per-token
+    # gaps (async/HTTP/detokenize) dominate and a measured A/B showed no end-to-end win yet, so it
+    # is OFF by default. It is kept as the precondition for CUDA-graph capture (fixed-shape KV),
+    # which is the real lever. Incompatible with the FlashInfer bridge and speculative decoding.
+    use_static_cache: bool = False
 
 
 @dataclass
@@ -91,6 +97,11 @@ class TransformersTextExecutor:
 
     def __init__(self, config: TransformersGenerationConfig | None = None) -> None:
         self.config = config or TransformersGenerationConfig()
+        self._use_static_cache = bool(self.config.use_static_cache)
+        # StaticCache needs a mask-respecting attention; force sdpa over the FlashInfer bridge.
+        self._attn = (
+            "sdpa" if self._use_static_cache else self.config.attention_backend.strip().lower()
+        )
         self._states: dict[str, _ServingState] = {}
         self.speculative_proposed_tokens = 0
         self.speculative_accepted_tokens = 0
@@ -104,6 +115,11 @@ class TransformersTextExecutor:
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            try:
+                from transformers import StaticCache
+            except ImportError:
+                from transformers.cache_utils import StaticCache
         except ImportError as exc:
             raise RuntimeError(
                 "TransformersTextExecutor requires the model extra: "
@@ -111,6 +127,7 @@ class TransformersTextExecutor:
             ) from exc
 
         self._torch = torch
+        self._StaticCache = StaticCache
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_id,
             trust_remote_code=self.config.trust_remote_code,
@@ -169,8 +186,9 @@ class TransformersTextExecutor:
             else None
         )
         return {
-            "attention_backend": self.config.attention_backend,
-            "speculative_enabled": self.draft_model is not None,
+            "attention_backend": self._attn,
+            "kv_cache_type": "static" if self._use_static_cache else "dynamic",
+            "speculative_enabled": self.draft_model is not None and not self._use_static_cache,
             "speculative_draft_model_id": self.config.speculative_draft_model_id,
             "speculative_tokens": self.config.speculative_tokens,
             "speculative_proposed_tokens": self.speculative_proposed_tokens,
@@ -197,19 +215,34 @@ class TransformersTextExecutor:
         state = self._ensure_state(sequence)
         device = self._model_device()
         input_ids = self._torch.tensor([batch.input_ids], dtype=self._torch.long, device=device)
-        attention_mask = self._torch.ones(
-            (1, state.prefilled_token_count + len(batch.input_ids)),
-            dtype=self._torch.long,
-            device=device,
-        )
 
-        with self._torch.inference_mode(), self._kv_write_context(batch):
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=state.past_key_values,
-                use_cache=True,
+        if self._use_static_cache:
+            if state.past_key_values is None:
+                state.past_key_values = self._new_static_cache(sequence, device)
+            start = state.prefilled_token_count
+            cache_position = self._torch.arange(
+                start, start + len(batch.input_ids), device=device
             )
+            with self._torch.inference_mode():
+                outputs = self.model(
+                    input_ids=input_ids,
+                    cache_position=cache_position,
+                    past_key_values=state.past_key_values,
+                    use_cache=True,
+                )
+        else:
+            attention_mask = self._torch.ones(
+                (1, state.prefilled_token_count + len(batch.input_ids)),
+                dtype=self._torch.long,
+                device=device,
+            )
+            with self._torch.inference_mode(), self._kv_write_context(batch):
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=state.past_key_values,
+                    use_cache=True,
+                )
 
         state.past_key_values = outputs.past_key_values
         state.prefilled_token_count += len(batch.input_ids)
@@ -266,6 +299,17 @@ class TransformersTextExecutor:
         self._states[sequence.seq_id] = state
         return state
 
+    def _new_static_cache(self, sequence: Sequence, device: object) -> object:
+        # Size the preallocated buffer to the full prompt + generation budget for this sequence.
+        max_cache_len = sequence.num_prompt_tokens + sequence.max_new_tokens + 1
+        return self._StaticCache(
+            config=self.model.config,
+            max_batch_size=1,
+            max_cache_len=max_cache_len,
+            device=device,
+            dtype=self.model.dtype,
+        )
+
     def _decode_next(self, sequence: Sequence, state: _ServingState) -> None:
         if not state.generated_token_ids:
             state.finished = True
@@ -274,23 +318,35 @@ class TransformersTextExecutor:
 
         device = self._model_device()
         input_ids = self._torch.tensor([[state.generated_token_ids[-1]]], device=device)
-        attention_mask = self._torch.ones(
-            (1, state.prompt_token_count + len(state.generated_token_ids)),
-            dtype=self._torch.long,
-            device=device,
-        )
-        write_plan = self._kv_write_plan(
-            sequence,
-            start_position=state.prompt_token_count + len(state.generated_token_ids) - 1,
-            token_count=1,
-        )
-        with self._torch.inference_mode(), self._kv_write_context(write_plan.slot_mapping):
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=state.past_key_values,
-                use_cache=True,
+
+        if self._use_static_cache:
+            position = state.prompt_token_count + len(state.generated_token_ids)
+            cache_position = self._torch.tensor([position], dtype=self._torch.long, device=device)
+            with self._torch.inference_mode():
+                outputs = self.model(
+                    input_ids=input_ids,
+                    cache_position=cache_position,
+                    past_key_values=state.past_key_values,
+                    use_cache=True,
+                )
+        else:
+            attention_mask = self._torch.ones(
+                (1, state.prompt_token_count + len(state.generated_token_ids)),
+                dtype=self._torch.long,
+                device=device,
             )
+            write_plan = self._kv_write_plan(
+                sequence,
+                start_position=state.prompt_token_count + len(state.generated_token_ids) - 1,
+                token_count=1,
+            )
+            with self._torch.inference_mode(), self._kv_write_context(write_plan.slot_mapping):
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=state.past_key_values,
+                    use_cache=True,
+                )
         state.past_key_values = outputs.past_key_values
         state.pending_token_id = self._sample_token(outputs.logits[:, -1, :], sequence)
 
@@ -503,6 +559,10 @@ class TransformersTextExecutor:
             state.draft_cached_len = 0
 
     def _speculative_enabled(self, sequence: Sequence, state: _ServingState) -> bool:
+        # The StaticCache fast path does not support the speculative rollback/replay logic; enable
+        # speculation only on the dynamic-cache path (SOLORT_STATIC_CACHE=0).
+        if self._use_static_cache:
+            return False
         if self.draft_model is None or self.config.speculative_tokens <= 0:
             return False
         if not state.generated_token_ids:
@@ -650,7 +710,7 @@ class TransformersTextExecutor:
 
     def _model_kwargs(self) -> dict[str, object]:
         kwargs: dict[str, object] = {}
-        attention_backend = self.config.attention_backend.strip().lower()
+        attention_backend = self._attn
         if attention_backend == "flashinfer":
             # Registering a Transformers attention implementation lets Qwen layers stay in HF while
             # their attention math dispatches to FlashInfer.
@@ -673,7 +733,7 @@ class TransformersTextExecutor:
         return kwargs
 
     def _kv_write_context(self, batch_or_slots: Batch | list[int] | None) -> object:
-        if self.config.attention_backend.strip().lower() != "flashinfer":
+        if self._attn != "flashinfer":
             return nullcontext()
         from solort.backends.transformers_flashinfer import solort_kv_write_context
 
@@ -715,7 +775,7 @@ class TransformersTextExecutor:
         )
 
     def _attention_backend_snapshot(self) -> dict[str, object]:
-        if self.config.attention_backend.strip().lower() != "flashinfer":
+        if self._attn != "flashinfer":
             return {}
         try:
             from solort.backends.transformers_flashinfer import flashinfer_attention_snapshot

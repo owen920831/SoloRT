@@ -1,5 +1,29 @@
 # Benchmark records
 
+## 2026-06-26 — vLLM baseline (the target to beat) + StaticCache probe
+
+Single-stream, temp=0, 200 tokens, RTX 4080 16 GB, same prompt. vLLM v0.8.5.post1 (CUDA 12.4 —
+`latest` needs CUDA 13.0 which the 12.6 driver rejects), which uses torch.compile + CUDA graphs.
+
+| model      | vLLM decode | vLLM TTFT | SoloRT decode (eager/dyn) | SoloRT TTFT | gap    |
+| ---------- | ----------- | --------- | ------------------------- | ----------- | ------ |
+| Qwen3-0.6B | 91.1 tps    | 22 ms     | ~12-15 tps                | ~150-180 ms | ~6-7x  |
+| Qwen3-4B   | 55.6 tps    | 30 ms     | ~11-12 tps                | ~180-310 ms | ~5x    |
+
+vLLM is ~5-7x faster on decode and ~6-10x on TTFT. The gap is CUDA graphs + compiled/fused kernels.
+
+CUDA-graph probe (isolated, Qwen3-0.6B decode, NOT through the serving stack):
+- eager + DynamicCache: 11.9 tok/s
+- eager + StaticCache:  27.0 tok/s  (2.3x — but this win does NOT survive SoloRT's serving stack;
+  a clean A/B through the server showed static 13.0 vs dynamic 15.5, i.e. the per-token serving
+  gaps dominate). StaticCache is kept as groundwork (default off); it is the precondition for
+  CUDA-graph capture.
+- torch.compile(reduce-overhead): 0.6 tok/s on torch 2.4 (NGC image) — recompile thrash; needs a
+  newer torch (>=2.6), which is the next step.
+
+Note: batch-1 launch-bound decode is noisy (~+/-30%) — isolate runs and lock clocks for reliable
+deltas.
+
 ## 2026-06-25 — single-stream roofline vs nano-vllm (the real bottleneck)
 
 Single-user, batch-1, temp=0, FlashInfer, spec off, RTX 4080 16 GB, 200 tokens, 4 runs.

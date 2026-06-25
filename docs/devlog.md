@@ -19,6 +19,21 @@ GPU experiments while the card is idle.
 - GPU experiments: `make docker-ngc-up` (spec, port 8000) + `make docker-ngc-up-nospec`
   (baseline) then `benchmarks/bench_serving.py`.
 
+## Active goal (2026-06-26): beat vLLM on single-stream, finish the paged/fast Qwen path
+
+Target: single-user, single-stream decode latency that beats vLLM for Qwen3 on one RTX 4080, then
+keep iterating. Established that we are **launch-bound** (~11 tps regardless of model size), so the
+primary lever is **CUDA graphs**, not paged memory management.
+
+Plan (iterative, measure every step against the vLLM baseline):
+1. Baseline: run vLLM single-stream on the same 4080 + same bench (the number to beat).
+2. Probe: quantify CUDA-graph upside — eager vs `torch.compile(reduce-overhead)` + StaticCache.
+3. Build a CUDA-graph decode path in SoloRT (compilable attention + static cache + captured graph),
+   measure vs vLLM, iterate.
+4. Layer the SoloRT paged KV (the "my direction" executor) under the fast forward for
+   memory/long-context, keeping the speed win.
+5. Fused kernels / further wins as needed.
+
 ## Backlog / roadmap (ranked by measured value)
 
 1. **Draft KV cache** (IN PROGRESS) — `_draft_tokens` re-runs the full prefix every draft step
@@ -31,6 +46,32 @@ GPU experiments while the card is idle.
    runner that reads/writes SoloRT pages directly (the long-term Phase 3 milestone). IN PROGRESS.
 
 ## Log
+
+### 2026-06-26 — Toward beating vLLM: diagnosis + StaticCache groundwork
+
+Goal: beat vLLM single-stream for Qwen3 on one 4080, finish the fast Qwen path, keep iterating.
+
+Findings this iteration (all measured on the 4080):
+- **CUDA-graph probe** (isolated, Qwen3-0.6B decode): eager+DynamicCache 11.9 tok/s; eager+
+  StaticCache **27 tok/s** (2.3x); `torch.compile(reduce-overhead)` 0.6 tok/s — torch 2.4 (the NGC
+  image) **recompile-thrashes**, so torch.compile is a dead end on that image.
+- **StaticCache through SoloRT's serving stack does NOT help** (clean isolated A/B: 0.6B dynamic
+  15.5 vs static 13.0; 4B dynamic 12.1 vs static 10.9). The isolated 2.3x evaporates because the
+  per-token serving gaps (async/HTTP/detokenize) dominate and a faster forward just leaves the GPU
+  idle/downclocked longer. So StaticCache is kept as **groundwork (default OFF)** — it is the
+  precondition for CUDA-graph capture, not a standalone win.
+- **Benchmark noise**: batch-1 launch-bound decode swings ~±30% (the same "dynamic" measured
+  11.5-15.5 across runs) because it is sensitive to GPU clock state and CPU contention. Lesson:
+  isolate runs (nothing else on CPU/GPU), warm up, and prefer locked clocks; small deltas are
+  noise.
+- **vLLM works on this driver** (v0.8.5.post1, CUDA 12.4 — `latest` needs CUDA 13.0 which the 12.6
+  driver rejects). Its speed is `torch.compile` + **CUDA graphs** (`use_cudagraph:true`), which need
+  a newer torch than the NGC image's 2.4.
+
+Conclusion / next lever: the only way to close the launch-bound gap is CUDA graphs. Since torch 2.4
+thrashes, the next iteration builds a SoloRT image on torch >=2.6 (cu124, driver-compatible) and
+enables `torch.compile(reduce-overhead)` + StaticCache on the decode path, measured vs the vLLM
+baseline.
 
 ### 2026-06-26 — Code simplification pass
 
