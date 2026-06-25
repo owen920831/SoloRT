@@ -171,11 +171,32 @@ def _torch_attention_fallback(
         value = value.repeat_interleave(groups, dim=1)
 
     scale = float(scaling)
+    q_len = query.shape[-2]
+    kv_len = key.shape[-2]
+    attn_mask = None
+    is_causal = False
+    if causal:
+        if q_len == kv_len:
+            # Square case (full prefill / first chunk): top-left and bottom-right agree.
+            is_causal = True
+        else:
+            # The query block is the LAST q_len positions of the kv sequence (HF appends new
+            # tokens to the end of the cache), so it needs bottom-right causal alignment, exactly
+            # like FlashInfer's causal=True. torch SDPA's is_causal=True is TOP-left aligned and
+            # would let query row 0 see only kv col 0, corrupting any forward over a populated
+            # cache (chunked prefill, speculative validation). Build the right-aligned mask.
+            offset = kv_len - q_len
+            q_idx = torch.arange(q_len, device=query.device).unsqueeze(1)
+            k_idx = torch.arange(kv_len, device=query.device).unsqueeze(0)
+            allowed = k_idx <= (q_idx + offset)
+            attn_mask = torch.zeros(q_len, kv_len, dtype=query.dtype, device=query.device)
+            attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
     output = torch.nn.functional.scaled_dot_product_attention(
         query,
         key,
         value,
-        is_causal=causal,
+        attn_mask=attn_mask,
+        is_causal=is_causal,
         scale=scale,
     )
     return output.transpose(1, 2).contiguous()
