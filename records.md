@@ -1,3 +1,40 @@
+# Benchmark records
+
+## 2026-06-25 — spec vs nospec with incremental draft KV cache
+
+Qwen3-4B target, Qwen3-0.6B draft (K=4), FlashInfer, temp=0, 220 max tokens, RTX 4080 16 GB,
+4 runs each (sequential — 16 GB can't hold both servers). Prompt: detailed speculative-decoding
+explanation. Code: branch `feat/draft-kv-cache`.
+
+| case   | overall tps | decode tps | ttft | total/run | gpu mem |
+| ------ | ----------- | ---------- | ---- | --------- | ------- |
+| nospec | 11.53       | 11.67      | 313 ms | 19.1 s  | 8.2 GB  |
+| spec   | 5.03        | 5.04       | 281 ms | 43.8 s  | 9.6 GB  |
+
+**spec/nospec speedup = 0.44x (speculative decoding is 2.3x SLOWER here).**
+
+Speculative counters (spec, 1100 tokens over 4 runs):
+- proposed=1928, accepted=610, rejected=1318, acceptance_rate=31.6%
+- draft_forward_tokens=2718 (~5.6 per round) -> the incremental draft KV cache works: the old
+  full-prefix loop would have fed hundreds of thousands of draft tokens for the same output.
+- flashinfer: spec prefill_calls=30535 / decode_calls=55992 / fallback=1;
+  nospec prefill_calls=539 / decode_calls=39420 / fallback=1.
+
+**Greedy non-exactness:** spec output diverges from nospec at char 55 (deterministically, all 4
+runs). Both models are internally deterministic. Root cause: emitted tokens come from the target
+validation forward (q_len=K+1 -> FlashInfer `single_prefill`), whose logits differ slightly from
+the `single_decode` kernel used in plain decode, flipping an argmax early. This is independent of
+the draft KV cache (which only touches the draft model); it is a property of the HF+FlashInfer
+speculative bridge and motivates a single-attention-path tensor-backed paged executor.
+
+**Takeaways:**
+1. The draft KV cache is a correct, contained win (kills the O(K x prefix) draft cost).
+2. For this pairing/content, speculative decoding is net-negative (low acceptance + per-round
+   target prefill-forward + 5 draft forwards with GPU->CPU syncs) and not output-exact -> it
+   should not be the default until the paged executor unifies the attention path.
+
+## Older runs (raw)
+
 [
   {
     "label": "spec",

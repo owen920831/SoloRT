@@ -32,6 +32,37 @@ GPU experiments while the card is idle.
 
 ## Log
 
+### 2026-06-25 — P2: GPU experiment result (spec is net-negative here)
+
+Ran spec (Qwen3-4B + 0.6B draft, K=4) vs nospec on the idle RTX 4080, temp=0, 220 tokens, 4 runs
+each. Full numbers in `records.md`. Summary:
+
+- **spec 5.03 tps vs nospec 11.53 tps -> spec is 2.3x SLOWER.**
+- The incremental draft KV cache works: only 2718 draft-forward-tokens for 1100 generated tokens
+  (~5.6/round). The old full-prefix loop would have fed orders of magnitude more. So P1 did its
+  job; the loss is elsewhere.
+- Acceptance is only 31.6% for this draft/content. Because an incremental cache yields proposals
+  identical to the full-prefix loop, this is the inherent acceptance, not a cache bug.
+- **spec output is NOT greedy-exact vs nospec** (diverges at char 55, deterministically). Emitted
+  tokens come from the target validation forward (FlashInfer `single_prefill`, q_len=K+1), whose
+  logits differ from the `single_decode` kernel used in plain decode -> early argmax flip. This is
+  independent of the draft cache (target path unchanged) and is a property of the HF+FlashInfer
+  bridge.
+
+Why spec loses: each round costs 1 target prefill-forward (K+1 tokens) + ~5 draft forwards (each
+with a GPU->CPU `.item()` sync) to emit ~2.3 tokens at 31.6% acceptance, vs nospec's 1 decode
+forward per token. The draft is cheaper now, but the per-round target prefill-forward + Python/sync
+overhead is not recovered.
+
+**Recommendation / next decisions (surface to user):**
+1. Disable speculation by default for this pairing (`SOLORT_SPECULATIVE_TOKENS=0`) — it currently
+   hurts latency and exactness.
+2. The real unlock is the tensor-backed paged executor: one paged-decode attention path for both
+   generation and validation -> exactness + no HF `past_key_values` juggling + cheaper validation.
+   This is the standing Phase 3/4 milestone and what the KV-mirror WIP is building toward.
+3. Cheaper experiments worth trying meanwhile: smaller K (2), a stronger/closer draft, and removing
+   per-draft-token GPU->CPU syncs.
+
 ### 2026-06-25 — Enable other LLMs
 
 The runtime was already model-agnostic (target picked via `SOLORT_MODEL_ID`; the paged KV layout
