@@ -59,6 +59,8 @@ class PagedKVCache:
         self.kv_cache: Any | None = None
         self.k_cache: Any | None = None
         self.v_cache: Any | None = None
+        self.mirrored_tokens = 0
+        self.mirror_skipped = 0
         if self.config.allocate_tensors:
             self.allocate_tensors()
 
@@ -69,9 +71,9 @@ class PagedKVCache:
     def allocate_tensors(self) -> None:
         """Allocate a FlashInfer-friendly KV tensor.
 
-        FlashInfer accepts either a single 5-D `[pages, 2, page, heads, dim]` tensor in NHD layout
-        or separate K/V tensors. SoloRT keeps the single tensor by default because it is compact to
-        pass through backend interfaces and mirrors the docs.
+        Each transformer layer owns an independent paged KV arena. The extra leading layer
+        dimension lets the HF attention bridge mirror K/V by `layer_idx` now, while preserving the
+        same per-layer `[pages, 2, page, heads, dim]` view that FlashInfer paged kernels consume.
         """
 
         try:
@@ -84,6 +86,7 @@ class PagedKVCache:
             raise ValueError("SoloRT v1 tensor-backed KV cache supports only NHD layout")
         self.kv_cache = torch.empty(
             (
+                self.config.num_layers,
                 self.config.num_pages,
                 2,
                 self.config.page_size,
@@ -93,8 +96,8 @@ class PagedKVCache:
             dtype=dtype,
             device=self.config.device,
         )
-        self.k_cache = self.kv_cache[:, 0]
-        self.v_cache = self.kv_cache[:, 1]
+        self.k_cache = self.kv_cache[:, :, 0]
+        self.v_cache = self.kv_cache[:, :, 1]
 
     def pages_required(self, token_count: int) -> int:
         if token_count <= 0:
@@ -185,6 +188,52 @@ class PagedKVCache:
             del block_table[transaction.original_block_len :]
             self.allocator.free(transaction.pages)
 
+    def store_layer_tokens(
+        self,
+        *,
+        layer_idx: int | None,
+        slot_mapping: list[int],
+        key: Any,
+        value: Any,
+    ) -> None:
+        """Mirror K/V tensors from the HF bridge into SoloRT's paged tensor cache.
+
+        The current executor still consumes Hugging Face `past_key_values`. This method is the
+        bridge toward the real paged executor: it writes the same K/V data into SoloRT-owned page
+        storage using the batch's slot mapping.
+        """
+
+        if layer_idx is None or not slot_mapping or not self.has_tensors:
+            self.mirror_skipped += 1
+            return
+        if layer_idx < 0 or layer_idx >= self.config.num_layers:
+            self.mirror_skipped += 1
+            return
+        if key.shape[0] != 1 or value.shape[0] != 1:
+            self.mirror_skipped += 1
+            return
+        if key.shape[1] != self.config.num_kv_heads or value.shape[1] != self.config.num_kv_heads:
+            self.mirror_skipped += 1
+            return
+        if key.shape[-1] != self.config.head_dim or value.shape[-1] != self.config.head_dim:
+            self.mirror_skipped += 1
+            return
+
+        token_count = min(len(slot_mapping), key.shape[-2], value.shape[-2])
+        if token_count <= 0:
+            self.mirror_skipped += 1
+            return
+
+        k_tokens = key[0, :, -token_count:, :].transpose(0, 1).contiguous()
+        v_tokens = value[0, :, -token_count:, :].transpose(0, 1).contiguous()
+        target_slots = slot_mapping[-token_count:]
+        for token_index, slot in enumerate(target_slots):
+            page_id = slot // self.config.page_size
+            page_offset = slot % self.config.page_size
+            self.k_cache[layer_idx, page_id, page_offset].copy_(k_tokens[token_index])
+            self.v_cache[layer_idx, page_id, page_offset].copy_(v_tokens[token_index])
+            self.mirrored_tokens += 1
+
     def snapshot(self) -> dict[str, int | str]:
         allocator = self.allocator.snapshot()
         return {
@@ -196,6 +245,8 @@ class PagedKVCache:
             "device": self.config.device,
             "layout": self.config.layout,
             "tensor_storage": "allocated" if self.has_tensors else "metadata_only",
+            "mirrored_tokens": self.mirrored_tokens,
+            "mirror_skipped": self.mirror_skipped,
         }
 
     def _torch_dtype(self, torch: Any) -> Any:

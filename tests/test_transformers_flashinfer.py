@@ -12,3 +12,4 @@ def test_flashinfer_attention_snapshot_is_import_safe() -> None:
     assert snapshot["attention_backend"] == ATTENTION_NAME
     assert snapshot["flashinfer_prefill_calls"] >= 0
     assert snapshot["flashinfer_decode_calls"] >= 0
+    assert snapshot["flashinfer_fallback_calls"] >= 0

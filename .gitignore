@@ -11,3 +11,8 @@ dist/
 .venv/
 venv/
 .env
+
+# Raw per-run benchmark dumps (curated results live in docs/devlog.md and records.md)
+/spec.json
+/nospec.json
+/spec_en.json

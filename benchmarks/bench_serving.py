@@ -54,6 +54,8 @@ def run_streaming_request(
     temperature: float,
     top_p: float | None,
     top_k: int | None,
+    repetition_penalty: float | None,
+    max_repeated_token_run: int | None,
     timeout: float,
 ) -> ServingRun:
     payload: dict[str, Any] = {
@@ -67,6 +69,10 @@ def run_streaming_request(
         payload["top_p"] = top_p
     if top_k is not None:
         payload["top_k"] = top_k
+    if repetition_penalty is not None:
+        payload["repetition_penalty"] = repetition_penalty
+    if max_repeated_token_run is not None:
+        payload["max_repeated_token_run"] = max_repeated_token_run
 
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -222,6 +228,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
+    parser.add_argument("--max-repeated-token-run", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -229,10 +237,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def normalize_sampling_args(
+    args: argparse.Namespace,
+) -> tuple[float | None, int | None, float | None]:
+    repetition_penalty = args.repetition_penalty
+    top_p = args.top_p
+    top_k = args.top_k
+    if args.temperature <= 0:
+        repetition_penalty = 1.0 if repetition_penalty is None else repetition_penalty
+        top_p = 1.0 if top_p is None else top_p
+        top_k = 0 if top_k is None else top_k
+    return top_p, top_k, repetition_penalty
+
+
 def main() -> None:
     args = build_parser().parse_args()
     cases = args.case or [("gpu", "http://127.0.0.1:8000")]
     all_runs: dict[str, list[ServingRun]] = {label: [] for label, _ in cases}
+    top_p, top_k, repetition_penalty = normalize_sampling_args(args)
 
     for label, url in cases:
         for _ in range(args.warmup):
@@ -243,8 +265,10 @@ def main() -> None:
                 prompt=args.prompt,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                max_repeated_token_run=args.max_repeated_token_run,
                 timeout=args.timeout,
             )
         for index in range(args.runs):
@@ -255,8 +279,10 @@ def main() -> None:
                 prompt=args.prompt,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                max_repeated_token_run=args.max_repeated_token_run,
                 timeout=args.timeout,
             )
             all_runs[label].append(run)

@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
+from solort.cache.kv_cache import KVCacheConfig, PagedKVCache
 from solort.core.batch import Batch
 from solort.core.sequence import Sequence
 from solort.core.session import Message
@@ -51,6 +52,20 @@ class _ServingState:
     finished: bool = False
 
 
+@dataclass(frozen=True)
+class _KVWritePlan:
+    """Physical slots for a model forward that appends K/V into SoloRT pages."""
+
+    slot_mapping: list[int]
+    transaction: object | None = None
+
+
+@dataclass(frozen=True)
+class _TargetForwardResult:
+    outputs: object
+    transaction: object | None = None
+
+
 class TransformersTextExecutor:
     """Hugging Face executor with explicit prefill and one-token decode.
 
@@ -68,6 +83,7 @@ class TransformersTextExecutor:
         self.speculative_proposed_tokens = 0
         self.speculative_accepted_tokens = 0
         self.speculative_rejected_tokens = 0
+        self.kv_cache: PagedKVCache | None = None
 
         try:
             import torch
@@ -102,6 +118,33 @@ class TransformersTextExecutor:
             self.model.to("cpu")
         self.model.eval()
         self.draft_model = self._load_draft_model()
+
+    def attach_kv_cache(self, kv_cache: PagedKVCache) -> None:
+        self.kv_cache = kv_cache
+
+    def kv_cache_config(
+        self,
+        *,
+        num_pages: int,
+        page_size: int,
+        allocate_tensors: bool,
+    ) -> KVCacheConfig:
+        model_config = self.model.config
+        head_dim = getattr(
+            model_config,
+            "head_dim",
+            model_config.hidden_size // model_config.num_attention_heads,
+        )
+        return KVCacheConfig(
+            num_layers=int(model_config.num_hidden_layers),
+            num_pages=num_pages,
+            page_size=page_size,
+            num_kv_heads=int(model_config.num_key_value_heads),
+            head_dim=int(head_dim),
+            dtype=_dtype_name(getattr(self.model, "dtype", None)),
+            device=str(self._model_device()),
+            allocate_tensors=allocate_tensors,
+        )
 
     def snapshot(self) -> dict[str, object]:
         acceptance_rate = (
@@ -143,7 +186,7 @@ class TransformersTextExecutor:
             device=device,
         )
 
-        with self._torch.inference_mode():
+        with self._torch.inference_mode(), self._kv_write_context(batch):
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -154,6 +197,8 @@ class TransformersTextExecutor:
         state.past_key_values = outputs.past_key_values
         state.prefilled_token_count += len(batch.input_ids)
         state.prompt_token_count = max(state.prompt_token_count, state.prefilled_token_count)
+        # The logits from the final prefill chunk already contain the first decode decision, so we
+        # cache it as `pending_token_id` instead of running an extra one-token forward.
         if state.prefilled_token_count >= sequence.num_prompt_tokens:
             state.pending_token_id = self._sample_token(outputs.logits[:, -1, :], sequence)
 
@@ -217,7 +262,12 @@ class TransformersTextExecutor:
             dtype=self._torch.long,
             device=device,
         )
-        with self._torch.inference_mode():
+        write_plan = self._kv_write_plan(
+            sequence,
+            start_position=state.prompt_token_count + len(state.generated_token_ids) - 1,
+            token_count=1,
+        )
+        with self._torch.inference_mode(), self._kv_write_context(write_plan.slot_mapping):
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -242,12 +292,17 @@ class TransformersTextExecutor:
             return [self._append_token_result(sequence, state, token_id)]
 
         original_past = state.past_key_values
+        # Target validation asks the 4B model to score the previous accepted token plus all draft
+        # candidates in one pass. Matching logits accept draft tokens; the first mismatch becomes
+        # the correction token.
         validate_outputs = self._target_forward_from_state(
+            sequence,
             state,
             [state.generated_token_ids[-1], *draft_tokens],
+            provisional=True,
         )
         target_tokens = [
-            self._greedy_token(validate_outputs.logits[:, index, :])
+            self._greedy_token(validate_outputs.outputs.logits[:, index, :])
             for index in range(len(draft_tokens))
         ]
 
@@ -266,26 +321,35 @@ class TransformersTextExecutor:
             # Full acceptance can keep the target forward pass cache because it already contains
             # every draft token. The extra recovery token is emitted but not cached until the next
             # one-token decode step, matching the non-speculative path.
-            state.past_key_values = validate_outputs.past_key_values
+            if validate_outputs.transaction is not None and self.kv_cache is not None:
+                self.kv_cache.commit_transaction(validate_outputs.transaction)
+            state.past_key_values = validate_outputs.outputs.past_key_values
             for token_id in draft_tokens:
                 results.append(self._append_token_result(sequence, state, token_id))
                 if state.finished:
                     return results
 
             if len(state.generated_token_ids) < sequence.max_new_tokens:
-                recovery_token = self._sample_token(validate_outputs.logits[:, -1, :], sequence)
+                recovery_token = self._sample_token(
+                    validate_outputs.outputs.logits[:, -1, :],
+                    sequence,
+                )
                 results.append(self._append_token_result(sequence, state, recovery_token))
             return results
 
         accepted_prefix = draft_tokens[:accepted]
         # Partial rejection is transactional: roll back the target cache to the original prefix,
         # replay only accepted draft tokens, then emit the target correction token.
+        if validate_outputs.transaction is not None and self.kv_cache is not None:
+            self.kv_cache.rollback_transaction(sequence.block_table, validate_outputs.transaction)
         state.past_key_values = original_past
         prefix_outputs = self._target_forward_from_state(
+            sequence,
             state,
             [state.generated_token_ids[-1], *accepted_prefix],
+            provisional=False,
         )
-        state.past_key_values = prefix_outputs.past_key_values
+        state.past_key_values = prefix_outputs.outputs.past_key_values
 
         for token_id in accepted_prefix:
             results.append(self._append_token_result(sequence, state, token_id))
@@ -296,7 +360,14 @@ class TransformersTextExecutor:
         results.append(self._append_token_result(sequence, state, correction_token))
         return results
 
-    def _target_forward_from_state(self, state: _ServingState, token_ids: list[int]) -> object:
+    def _target_forward_from_state(
+        self,
+        sequence: Sequence,
+        state: _ServingState,
+        token_ids: list[int],
+        *,
+        provisional: bool,
+    ) -> _TargetForwardResult:
         device = self._model_device()
         input_ids = self._torch.tensor([token_ids], dtype=self._torch.long, device=device)
         attention_mask = self._torch.ones(
@@ -304,13 +375,22 @@ class TransformersTextExecutor:
             dtype=self._torch.long,
             device=device,
         )
-        with self._torch.inference_mode():
-            return self.model(
+        current_token_count = state.prompt_token_count + len(state.generated_token_ids)
+        write_plan = self._kv_write_plan(
+            sequence,
+            start_position=current_token_count - 1,
+            token_count=len(token_ids),
+            current_token_count=current_token_count,
+            provisional_append_tokens=max(0, len(token_ids) - 1) if provisional else 0,
+        )
+        with self._torch.inference_mode(), self._kv_write_context(write_plan.slot_mapping):
+            outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 past_key_values=state.past_key_values,
                 use_cache=True,
             )
+        return _TargetForwardResult(outputs=outputs, transaction=write_plan.transaction)
 
     def _draft_tokens(
         self,
@@ -326,6 +406,8 @@ class TransformersTextExecutor:
         proposed: list[int] = []
         with self._torch.inference_mode():
             for _ in range(draft_count):
+                # This draft loop is intentionally simple and correctness-first. It does not yet
+                # keep a draft KV cache, which is why speculative speedup is modest in this bridge.
                 input_ids = self._torch.tensor([draft_ids], dtype=self._torch.long, device=device)
                 outputs = self.draft_model(input_ids=input_ids, use_cache=False)
                 token_id = self._greedy_token(outputs.logits[:, -1, :])
@@ -351,6 +433,8 @@ class TransformersTextExecutor:
         if repetition_penalty != 1.0:
             return False
         temperature = float(sequence.metadata.get("temperature", self.config.default_temperature))
+        # v1 uses exact greedy speculative decoding. Sampling needs stochastic acceptance math and
+        # is intentionally disabled here.
         return temperature <= 0
 
     def _sample_token(self, logits: object, sequence: Sequence) -> int:
@@ -485,6 +569,8 @@ class TransformersTextExecutor:
         kwargs: dict[str, object] = {}
         attention_backend = self.config.attention_backend.strip().lower()
         if attention_backend == "flashinfer":
+            # Registering a Transformers attention implementation lets Qwen layers stay in HF while
+            # their attention math dispatches to FlashInfer.
             from solort.backends.transformers_flashinfer import (
                 ATTENTION_NAME,
                 register_solort_flashinfer_attention,
@@ -502,6 +588,48 @@ class TransformersTextExecutor:
         if self.config.device_map != "cpu":
             kwargs["device_map"] = self.config.device_map
         return kwargs
+
+    def _kv_write_context(self, batch_or_slots: Batch | list[int] | None) -> object:
+        if self.config.attention_backend.strip().lower() != "flashinfer":
+            return _null_context()
+        from solort.backends.transformers_flashinfer import solort_kv_write_context
+
+        slot_mapping = (
+            batch_or_slots.slot_mapping
+            if isinstance(batch_or_slots, Batch)
+            else batch_or_slots
+        )
+        return solort_kv_write_context(
+            self.kv_cache,
+            slot_mapping,
+        )
+
+    def _kv_write_plan(
+        self,
+        sequence: Sequence,
+        *,
+        start_position: int,
+        token_count: int,
+        current_token_count: int | None = None,
+        provisional_append_tokens: int = 0,
+    ) -> _KVWritePlan:
+        if self.kv_cache is None or token_count <= 0:
+            return _KVWritePlan(slot_mapping=[])
+        end_position = start_position + token_count
+        if provisional_append_tokens > 0:
+            transaction = self.kv_cache.begin_append_transaction(
+                sequence.block_table,
+                current_token_count=current_token_count or start_position + 1,
+                append_token_count=provisional_append_tokens,
+            )
+        else:
+            transaction = None
+            self.kv_cache.ensure_capacity(sequence.block_table, end_position)
+        positions = list(range(start_position, end_position))
+        return _KVWritePlan(
+            slot_mapping=self.kv_cache.slot_mapping(sequence.block_table, positions),
+            transaction=transaction,
+        )
 
     def _attention_backend_snapshot(self) -> dict[str, object]:
         if self.config.attention_backend.strip().lower() != "flashinfer":
@@ -566,12 +694,23 @@ class PagedQwenExecutor(TransformersTextExecutor):
 
     def snapshot(self) -> dict[str, object]:
         data = super().snapshot()
+        mirrored = self.kv_cache is not None and self.kv_cache.has_tensors
         data.update(
             {
                 "target_model_id": self.config.model_id,
-                "cache_boundary": "solort-page-metadata + hf-past-key-values",
+                "cache_boundary": (
+                    "solort-page-metadata + solort-kv-mirror + hf-past-key-values"
+                    if mirrored
+                    else "solort-page-metadata + hf-past-key-values"
+                ),
                 "paged_executor_status": (
-                    "FlashInfer HF attention bridge enabled; tensor-backed paged runner pending"
+                    "FlashInfer HF attention bridge enabled; "
+                    "SoloRT KV mirror enabled; tensor-backed paged runner pending"
+                    if mirrored
+                    else (
+                        "FlashInfer HF attention bridge enabled; "
+                        "tensor-backed paged runner pending"
+                    )
                 ),
             }
         )
@@ -591,3 +730,23 @@ def _text_delta(previous_text: str, new_text: str) -> str:
     while common < max_common and previous_text[common] == new_text[common]:
         common += 1
     return new_text[common:]
+
+
+def _dtype_name(dtype: object | None) -> str:
+    text = str(dtype or "float16").replace("torch.", "")
+    if text == "float16":
+        return "fp16"
+    if text == "bfloat16":
+        return "bf16"
+    if text == "float32":
+        return "fp32"
+    return text
+
+
+class _null_context:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *args: object) -> bool:
+        del args
+        return False

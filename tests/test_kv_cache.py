@@ -54,3 +54,29 @@ def test_kv_cache_slot_mapping_rejects_missing_page() -> None:
 
     with pytest.raises(IndexError):
         cache.slot_mapping([0], [4])
+
+
+def test_tensor_backed_kv_cache_mirrors_layer_tokens() -> None:
+    torch = pytest.importorskip("torch")
+    cache = PagedKVCache(
+        KVCacheConfig(
+            num_layers=2,
+            num_pages=2,
+            page_size=4,
+            num_kv_heads=2,
+            head_dim=4,
+            dtype="fp32",
+            device="cpu",
+            allocate_tensors=True,
+        )
+    )
+    key = torch.arange(1 * 2 * 3 * 4, dtype=torch.float32).reshape(1, 2, 3, 4)
+    value = key + 100
+
+    cache.store_layer_tokens(layer_idx=1, slot_mapping=[0, 1, 5], key=key, value=value)
+
+    assert cache.snapshot()["tensor_storage"] == "allocated"
+    assert cache.snapshot()["mirrored_tokens"] == 3
+    assert torch.equal(cache.k_cache[1, 0, 0], key[0, :, 0, :])
+    assert torch.equal(cache.k_cache[1, 0, 1], key[0, :, 1, :])
+    assert torch.equal(cache.v_cache[1, 1, 1], value[0, :, 2, :])

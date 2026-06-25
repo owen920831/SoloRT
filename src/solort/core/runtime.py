@@ -49,6 +49,9 @@ class RuntimeCore:
         if executor is None:
             raise ValueError("RuntimeCore requires an executor; use build_default_runtime()")
         self.executor = executor
+        attach_kv_cache = getattr(self.executor, "attach_kv_cache", None)
+        if callable(attach_kv_cache):
+            attach_kv_cache(self.kv_cache)
         self.session_manager = session_manager or SessionManager()
         self.metrics = metrics or RuntimeMetrics()
         self.vram_manager = vram_manager or VRAMBudgetManager()
@@ -90,10 +93,13 @@ class RuntimeCore:
             ),
             "enable_thinking": bool(enable_thinking) if enable_thinking is not None else False,
         }
+        # Todo: can reuse history kvcache?
         input_ids = self._tokenize_for_executor(
             context_messages,
             enable_thinking=bool(metadata["enable_thinking"]),
         )
+        # Prefix cache is deliberately queried after chat-template tokenization. That keeps cache
+        # keys aligned with the exact token stream seen by the model.
         prefix_match = (
             self.prefix_cache.match(input_ids)
             if self._supports_prefix_cache()
@@ -177,6 +183,8 @@ class RuntimeCore:
             total_tokens_after_chunk = (
                 sequence.num_cached_tokens + sequence.num_scheduled_tokens + len(batch.input_ids)
             )
+            # Even while the HF bridge owns dense `past_key_values`, SoloRT still builds the paged
+            # metadata that the future FlashInfer paged executor will consume.
             self.kv_cache.ensure_capacity(sequence.block_table, total_tokens_after_chunk)
             self._attach_kv_metadata(
                 batch,
@@ -199,6 +207,8 @@ class RuntimeCore:
             return []
 
         total_tokens_after_decode = sequence.num_prompt_tokens + len(sequence.output_ids) + 1
+        # Decode allocates for exactly one new logical token. Speculative decode may return several
+        # accepted tokens, but the current HF bridge keeps their dense cache internally.
         self.kv_cache.ensure_capacity(sequence.block_table, total_tokens_after_decode)
         self._attach_kv_metadata(batch, token_count=total_tokens_after_decode)
         samples = self._normalize_samples(self.executor.forward_decode(batch))
@@ -261,6 +271,9 @@ class RuntimeCore:
 
     def _attach_kv_metadata(self, batch: Batch, *, token_count: int) -> KVCacheMetadata:
         sequence = batch.seqs[0]
+        # These four fields are the handoff contract between scheduling/cache policy and attention:
+        # logical positions are mapped to physical KV slots, while page arrays describe each
+        # sequence's active prefix.
         metadata = self.kv_cache.metadata_for(
             sequence.block_table,
             token_count=token_count,
@@ -344,7 +357,30 @@ def build_default_runtime() -> RuntimeCore:
         )
     else:
         raise ValueError(f"unknown SOLORT_EXECUTOR={executor_name!r}")
-    return RuntimeCore(executor=executor)
+    kv_cache = _build_runtime_kv_cache(executor)
+    return RuntimeCore(executor=executor, kv_cache=kv_cache)
+
+
+def _build_runtime_kv_cache(executor: ModelExecutor) -> PagedKVCache:
+    num_pages = _env_int("SOLORT_KV_NUM_PAGES", default=1024)
+    page_size = _env_int("SOLORT_KV_PAGE_SIZE", default=16)
+    allocate_tensors = _env_bool("SOLORT_KV_TENSOR_STORAGE", default=False)
+    config_factory = getattr(executor, "kv_cache_config", None)
+    if callable(config_factory):
+        return PagedKVCache(
+            config_factory(
+                num_pages=num_pages,
+                page_size=page_size,
+                allocate_tensors=allocate_tensors,
+            )
+        )
+    return PagedKVCache(
+        KVCacheConfig(
+            num_pages=num_pages,
+            page_size=page_size,
+            allocate_tensors=allocate_tensors,
+        )
+    )
 
 
 def _env_bool(name: str, *, default: bool) -> bool:

@@ -8,6 +8,9 @@ CPU_PORT ?= 8001
 HF_HOME ?= $(HOME)/.cache/huggingface
 QWEN06B_MODEL ?= Qwen/Qwen3-0.6B
 QWEN4B_MODEL ?= Qwen/Qwen3-4B
+KV_TENSOR_STORAGE ?= 0
+KV_NUM_PAGES ?= 1024
+KV_PAGE_SIZE ?= 16
 
 .PHONY: docker-build docker-down docker-test docker-lint docker-shell docker-llm-build docker-llm-up docker-llm-shell docker-ngc-build docker-ngc-up docker-ngc-up-qwen4b docker-ngc-up-nospec docker-ngc-up-cpu docker-ngc-probe docker-ngc-shell docker-hf-prefetch docker-serving-bench docker-spec-bench compose-test compose-lint
 
@@ -61,9 +64,15 @@ docker-llm-up:
 		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
 		-e SOLORT_SPECULATIVE_TOKENS=4 \
 		-e SOLORT_ATTENTION_BACKEND=flashinfer \
+		-e SOLORT_KV_TENSOR_STORAGE=$(KV_TENSOR_STORAGE) \
+		-e SOLORT_KV_NUM_PAGES=$(KV_NUM_PAGES) \
+		-e SOLORT_KV_PAGE_SIZE=$(KV_PAGE_SIZE) \
 		-e SOLORT_ENABLE_THINKING=0 \
 		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
+		-v $(PWD)/src:/app/src \
+		-v $(PWD)/docs:/app/docs \
+		-v $(PWD)/scripts:/app/scripts \
 		$(LLM_IMAGE)
 
 docker-llm-shell:
@@ -74,8 +83,14 @@ docker-llm-shell:
 		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
 		-e SOLORT_SPECULATIVE_TOKENS=4 \
 		-e SOLORT_ATTENTION_BACKEND=flashinfer \
+		-e SOLORT_KV_TENSOR_STORAGE=$(KV_TENSOR_STORAGE) \
+		-e SOLORT_KV_NUM_PAGES=$(KV_NUM_PAGES) \
+		-e SOLORT_KV_PAGE_SIZE=$(KV_PAGE_SIZE) \
 		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
+		-v $(PWD)/src:/app/src \
+		-v $(PWD)/docs:/app/docs \
+		-v $(PWD)/scripts:/app/scripts \
 		$(LLM_IMAGE) /bin/bash
 
 docker-ngc-up:
@@ -88,9 +103,15 @@ docker-ngc-up:
 		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
 		-e SOLORT_SPECULATIVE_TOKENS=4 \
 		-e SOLORT_ATTENTION_BACKEND=flashinfer \
+		-e SOLORT_KV_TENSOR_STORAGE=$(KV_TENSOR_STORAGE) \
+		-e SOLORT_KV_NUM_PAGES=$(KV_NUM_PAGES) \
+		-e SOLORT_KV_PAGE_SIZE=$(KV_PAGE_SIZE) \
 		-e SOLORT_ENABLE_THINKING=0 \
 		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
+		-v $(PWD)/src:/app/src \
+		-v $(PWD)/docs:/app/docs \
+		-v $(PWD)/scripts:/app/scripts \
 		$(NGC_IMAGE)
 
 docker-ngc-up-qwen4b:
@@ -103,9 +124,15 @@ docker-ngc-up-qwen4b:
 		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
 		-e SOLORT_SPECULATIVE_TOKENS=4 \
 		-e SOLORT_ATTENTION_BACKEND=flashinfer \
+		-e SOLORT_KV_TENSOR_STORAGE=$(KV_TENSOR_STORAGE) \
+		-e SOLORT_KV_NUM_PAGES=$(KV_NUM_PAGES) \
+		-e SOLORT_KV_PAGE_SIZE=$(KV_PAGE_SIZE) \
 		-e SOLORT_ENABLE_THINKING=0 \
 		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
+		-v $(PWD)/src:/app/src \
+		-v $(PWD)/docs:/app/docs \
+		-v $(PWD)/scripts:/app/scripts \
 		$(NGC_IMAGE)
 
 docker-ngc-up-nospec:
@@ -118,9 +145,15 @@ docker-ngc-up-nospec:
 		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID= \
 		-e SOLORT_SPECULATIVE_TOKENS=0 \
 		-e SOLORT_ATTENTION_BACKEND=flashinfer \
+		-e SOLORT_KV_TENSOR_STORAGE=$(KV_TENSOR_STORAGE) \
+		-e SOLORT_KV_NUM_PAGES=$(KV_NUM_PAGES) \
+		-e SOLORT_KV_PAGE_SIZE=$(KV_PAGE_SIZE) \
 		-e SOLORT_ENABLE_THINKING=0 \
 		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
+		-v $(PWD)/src:/app/src \
+		-v $(PWD)/docs:/app/docs \
+		-v $(PWD)/scripts:/app/scripts \
 		$(NGC_IMAGE)
 
 docker-ngc-up-cpu:
@@ -131,9 +164,15 @@ docker-ngc-up-cpu:
 		-e SOLORT_MODEL_ID=$(QWEN06B_MODEL) \
 		-e SOLORT_DEVICE_MAP=cpu \
 		-e SOLORT_TORCH_DTYPE=float32 \
+		-e SOLORT_KV_TENSOR_STORAGE=$(KV_TENSOR_STORAGE) \
+		-e SOLORT_KV_NUM_PAGES=$(KV_NUM_PAGES) \
+		-e SOLORT_KV_PAGE_SIZE=$(KV_PAGE_SIZE) \
 		-e SOLORT_ENABLE_THINKING=0 \
 		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
+		-v $(PWD)/src:/app/src \
+		-v $(PWD)/docs:/app/docs \
+		-v $(PWD)/scripts:/app/scripts \
 		$(NGC_IMAGE)
 
 docker-serving-bench:
@@ -165,8 +204,14 @@ docker-ngc-shell:
 		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
 		-e SOLORT_SPECULATIVE_TOKENS=4 \
 		-e SOLORT_ATTENTION_BACKEND=flashinfer \
+		-e SOLORT_KV_TENSOR_STORAGE=$(KV_TENSOR_STORAGE) \
+		-e SOLORT_KV_NUM_PAGES=$(KV_NUM_PAGES) \
+		-e SOLORT_KV_PAGE_SIZE=$(KV_PAGE_SIZE) \
 		-e HF_HOME=/root/.cache/huggingface \
 		-v $(HF_HOME):/root/.cache/huggingface \
+		-v $(PWD)/src:/app/src \
+		-v $(PWD)/docs:/app/docs \
+		-v $(PWD)/scripts:/app/scripts \
 		$(NGC_IMAGE) /bin/bash
 
 docker-hf-prefetch:

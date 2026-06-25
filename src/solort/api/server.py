@@ -29,6 +29,8 @@ def create_app(runtime: RuntimeCore | None = None) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest) -> object:
         core: RuntimeCore = app.state.runtime
+        # The API layer stays thin: normalize OpenAI-style JSON into a SoloRT Sequence, then let
+        # RuntimeCore own session context, scheduling, cache metadata, and model execution.
         sequence = core.add_request(
             model_id=request.model,
             messages=request.core_messages(),

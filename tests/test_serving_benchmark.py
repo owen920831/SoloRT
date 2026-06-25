@@ -8,6 +8,7 @@ from benchmarks.bench_serving import (
     _overall_tps,
     _percentile,
     iter_sse_payloads,
+    normalize_sampling_args,
     parse_case,
     summarize_runs,
 )
@@ -90,3 +91,13 @@ def test_percentile_and_tps_helpers() -> None:
 
 def test_parse_case_requires_label_and_url() -> None:
     assert parse_case("cpu=http://127.0.0.1:8001") == ("cpu", "http://127.0.0.1:8001")
+
+
+def test_normalize_sampling_args_uses_spec_friendly_greedy_defaults() -> None:
+    class Args:
+        temperature = 0.0
+        top_p = None
+        top_k = None
+        repetition_penalty = None
+
+    assert normalize_sampling_args(Args()) == (1.0, 0, 1.0)
