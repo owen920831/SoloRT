@@ -269,12 +269,14 @@ Start the Qwen3 API:
 make docker-llm-up
 ```
 
-The default NGC target runs `Qwen/Qwen3-4B` as the target model and `Qwen/Qwen3-0.6B` as the
-draft model for greedy speculative decoding:
+The default `docker-ngc-up` target serves `Qwen/Qwen3-4B` with speculative decoding **off**
+(`SPEC_TOKENS=0`). A GPU experiment (see [records.md](records.md)) showed the Qwen3-0.6B->4B
+HF+FlashInfer speculative path is currently a net latency loss and not output-exact, so it is
+opt-in. Enable it explicitly with the demo target (or `make docker-ngc-up SPEC_TOKENS=4`):
 
 ```bash
 make docker-ngc-build
-make docker-ngc-up-qwen4b
+make docker-ngc-up-qwen4b   # Qwen3-4B target + Qwen3-0.6B greedy speculative draft (K=4)
 ```
 
 On an RTX 4080 16 GB-class card, use the GPU path; CPU serving for 4B is intentionally not wired as
@@ -293,7 +295,7 @@ container so later runs can reuse the weights. The default runtime environment i
 SOLORT_EXECUTOR=paged
 SOLORT_MODEL_ID=Qwen/Qwen3-4B
 SOLORT_SPECULATIVE_DRAFT_MODEL_ID=Qwen/Qwen3-0.6B
-SOLORT_SPECULATIVE_TOKENS=4
+SOLORT_SPECULATIVE_TOKENS=0   # speculation off by default; set 4 to enable (see records.md)
 SOLORT_ATTENTION_BACKEND=flashinfer
 SOLORT_ENABLE_THINKING=0
 ```

@@ -39,7 +39,10 @@ class TransformersGenerationConfig:
     default_repetition_penalty: float = 1.08
     default_max_repeated_token_run: int = 16
     speculative_draft_model_id: str | None = "Qwen/Qwen3-0.6B"
-    speculative_tokens: int = 4
+    # Speculative decoding is opt-in (0 = off). The GPU experiment in records.md shows that for the
+    # Qwen3-0.6B->4B HF+FlashInfer bridge it is currently a net latency loss and not output-exact;
+    # set SOLORT_SPECULATIVE_TOKENS>0 to enable it.
+    speculative_tokens: int = 0
     speculative_draft_device_map: str | None = None
     attention_backend: str = "auto"
 

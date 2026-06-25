@@ -22,7 +22,9 @@ KV_PAGE_SIZE ?= 16
 # bridge does not model exactly (e.g. Gemma2 logit soft-capping, MLA).
 MODEL ?= $(QWEN4B_MODEL)
 DRAFT_MODEL ?= $(QWEN06B_MODEL)
-SPEC_TOKENS ?= 4
+# Speculative decoding is opt-in: it is a net latency loss for the Qwen3 0.6B->4B bridge today
+# (see records.md). Enable with SPEC_TOKENS=4, or use the docker-ngc-up-qwen4b demo target.
+SPEC_TOKENS ?= 0
 ATTENTION_BACKEND ?= flashinfer
 TRUST_REMOTE_CODE ?= 0
 
@@ -115,7 +117,7 @@ docker-ngc-up:
 		-e SOLORT_EXECUTOR=paged \
 		-e SOLORT_MODEL_ID=$(QWEN4B_MODEL) \
 		-e SOLORT_SPECULATIVE_DRAFT_MODEL_ID=$(QWEN06B_MODEL) \
-		-e SOLORT_SPECULATIVE_TOKENS=4 \
+		-e SOLORT_SPECULATIVE_TOKENS=$(SPEC_TOKENS) \
 		-e SOLORT_ATTENTION_BACKEND=flashinfer \
 		-e SOLORT_KV_TENSOR_STORAGE=$(KV_TENSOR_STORAGE) \
 		-e SOLORT_KV_NUM_PAGES=$(KV_NUM_PAGES) \

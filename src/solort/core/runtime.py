@@ -333,7 +333,7 @@ def build_default_runtime() -> RuntimeCore:
                     "SOLORT_SPECULATIVE_DRAFT_MODEL_ID",
                     "Qwen/Qwen3-0.6B",
                 ),
-                speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=4),
+                speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=0),
                 speculative_draft_device_map=os.getenv("SOLORT_SPECULATIVE_DRAFT_DEVICE_MAP"),
                 attention_backend=os.getenv("SOLORT_ATTENTION_BACKEND", "flashinfer"),
             )
@@ -350,7 +350,7 @@ def build_default_runtime() -> RuntimeCore:
                     "SOLORT_SPECULATIVE_DRAFT_MODEL_ID",
                     "Qwen/Qwen3-0.6B",
                 ),
-                speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=4),
+                speculative_tokens=_env_int("SOLORT_SPECULATIVE_TOKENS", default=0),
                 speculative_draft_device_map=os.getenv("SOLORT_SPECULATIVE_DRAFT_DEVICE_MAP"),
                 attention_backend=os.getenv("SOLORT_ATTENTION_BACKEND", "auto"),
             )

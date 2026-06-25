@@ -32,6 +32,22 @@ GPU experiments while the card is idle.
 
 ## Log
 
+### 2026-06-25 — Decision: speculation off by default + fix SDPA fallback
+
+User picked "paged executor + spec off" after the P2 result. Actions:
+
+- **Speculation is now opt-in** (`speculative_tokens=0` in code/env defaults; `SPEC_TOKENS ?= 0`
+  in the Makefile; `docker-ngc-up` follows it). Re-enable with `SPEC_TOKENS=4` or the
+  `docker-ngc-up-qwen4b` demo target. README + records.md explain why.
+- **Fixed a HIGH-severity bug** an adversarial review surfaced: the torch-SDPA fallback used
+  `is_causal=True` (top-left aligned), which corrupts any forward over a populated KV cache
+  (chunked-prefill 2nd+ chunks, speculative validation) on hosts without flashinfer. Now uses an
+  explicit bottom-right mask, matching FlashInfer. The review confirmed the draft KV cache itself
+  is correct.
+- Next: the tensor-backed paged executor (one attention path for generate + validate). First
+  concrete step is KV-mirror numerical validation — confirm the mirrored paged tensor matches HF
+  `past_key_values` so the executor can trust SoloRT-owned KV.
+
 ### 2026-06-25 — P2: GPU experiment result (spec is net-negative here)
 
 Ran spec (Qwen3-4B + 0.6B draft, K=4) vs nospec on the idle RTX 4080, temp=0, 220 tokens, 4 runs
