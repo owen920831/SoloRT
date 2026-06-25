@@ -6,14 +6,20 @@
 KV (position read from a buffer, masked attention), with the single-token decode step captured once
 into a CUDA graph and replayed per token. Single-stream, temp=0, through the full SoloRT server.
 
-| model      | SoloRT cudagraph (SDPA) | vLLM v0.8.5 | SoloRT/vLLM | vs old SoloRT (~12 tps) |
-| ---------- | ----------------------- | ----------- | ----------- | ----------------------- |
-| Qwen3-0.6B | 157.7 tps               | 91.1 tps    | **1.73x**   | 13x                     |
-| Qwen3-4B   | 44.5 tps                | 55.6 tps    | 0.80x       | 4.0x                    |
+| model      | SoloRT cudagraph | vLLM v0.8.5 | SoloRT/vLLM | vs old SoloRT (~12 tps) |
+| ---------- | ---------------- | ----------- | ----------- | ----------------------- |
+| Qwen3-0.6B | 164.0 tps        | 91.1 tps    | **1.80x**   | 13.7x                   |
+| Qwen3-4B   | 45.2 tps         | 55.6 tps    | 0.81x       | 4.1x                    |
 
-(Manual fp32-score attention -> `F.scaled_dot_product_attention` flash kernel lifted 0.6B from
-108.9 to 157.7 tps. 4B barely moved: it still scans the full graph_max_len each step and the big
-unfused projection GEMMs dominate.)
+Progression of the cudagraph executor (0.6B / 4B decode tps): manual-attn 108.9 / 42.9 ->
+SDPA-flash 157.7 / 44.5 -> +fused QKV & gate/up GEMMs 164.0 / 45.2.
+
+**We decisively beat vLLM single-stream decode on 0.6B (1.80x).** 4B is at 0.81x (4x over the old
+HF path). The remaining 4B gap is kernel sophistication: vLLM's paged FlashAttention computes only
+the live length, whereas our SDPA still scans graph_max_len each step (4B @ MAXLEN=256 -> 47.9 tps
+vs 45.2 @ 1024), plus vLLM fuses RMSNorm/residual. Next frontier for 4B: a paged decode kernel
+(FlashInfer BatchDecode) reading length from buffers inside the graph, and fused norms. TTFT also
+lags (prefill is not graph-captured).
 
 **We beat vLLM single-stream decode on 0.6B (1.19x) and reach 0.77x on 4B** (3.9x over the old HF
 path). Isolated micro-benchmark (no server) hit 131.9 tps on 0.6B (eager-custom 27.4) — CUDA graphs

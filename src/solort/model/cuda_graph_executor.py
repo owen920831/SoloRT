@@ -45,15 +45,20 @@ class _GraphQwen3Runner:
         self.embed = model.model.embed_tokens.weight
         self.final_norm = model.model.norm.weight
         self.lm_head = model.lm_head.weight
+        self.q_dim = self.nh * self.hd
+        self.kv_dim = self.nkv * self.hd
         self.layers = []
         for i in range(self.L):
             a, mlp = model.model.layers[i].self_attn, model.model.layers[i].mlp
+            # Fuse QKV (3 GEMMs -> 1) and gate/up (2 -> 1): bigger, more efficient GEMMs.
+            wqkv = torch.cat([a.q_proj.weight, a.k_proj.weight, a.v_proj.weight], 0).contiguous()
+            wgu = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], 0).contiguous()
+            self.inter = mlp.gate_proj.weight.shape[0]
             self.layers.append({
                 "in_ln": model.model.layers[i].input_layernorm.weight,
                 "post_ln": model.model.layers[i].post_attention_layernorm.weight,
-                "wq": a.q_proj.weight, "wk": a.k_proj.weight, "wv": a.v_proj.weight,
-                "wo": a.o_proj.weight, "qn": a.q_norm.weight, "kn": a.k_norm.weight,
-                "wg": mlp.gate_proj.weight, "wu": mlp.up_proj.weight, "wd": mlp.down_proj.weight,
+                "wqkv": wqkv, "wo": a.o_proj.weight, "qn": a.q_norm.weight, "kn": a.k_norm.weight,
+                "wgu": wgu, "wd": mlp.down_proj.weight,
             })
         self.inv_freq = 1.0 / (
             float(c.rope_theta) ** (torch.arange(0, self.hd, 2, device=self.dev).float() / self.hd)
@@ -83,9 +88,11 @@ class _GraphQwen3Runner:
         x = self.embed[ids].to(self.dt)
         for li, ly in enumerate(self.layers):
             h = _rmsnorm(x, ly["in_ln"], self.eps)
-            q = (h @ ly["wq"].T).view(t, self.nh, self.hd).transpose(0, 1)
-            k = (h @ ly["wk"].T).view(t, self.nkv, self.hd).transpose(0, 1)
-            v = (h @ ly["wv"].T).view(t, self.nkv, self.hd).transpose(0, 1)
+            qkv = h @ ly["wqkv"].T
+            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+            q = (q.view(t, self.nh, self.hd)).transpose(0, 1)
+            k = (k.view(t, self.nkv, self.hd)).transpose(0, 1)
+            v = (v.view(t, self.nkv, self.hd)).transpose(0, 1)
             q = self._rope(_rmsnorm(q, ly["qn"], self.eps), cos, sin)
             k = self._rope(_rmsnorm(k, ly["kn"], self.eps), cos, sin)
             self.kc[li, :t] = k.transpose(0, 1)
@@ -99,7 +106,8 @@ class _GraphQwen3Runner:
             )
             x = x + ctx @ ly["wo"].T
             h2 = _rmsnorm(x, ly["post_ln"], self.eps)
-            x = x + (F.silu(h2 @ ly["wg"].T) * (h2 @ ly["wu"].T)) @ ly["wd"].T
+            gate, up = (h2 @ ly["wgu"].T).split([self.inter, self.inter], dim=-1)
+            x = x + (F.silu(gate) * up) @ ly["wd"].T
         x = _rmsnorm(x, self.final_norm, self.eps)
         return (x[-1:] @ self.lm_head.T).float()
 
@@ -109,9 +117,11 @@ class _GraphQwen3Runner:
         keep = (self.arange <= self.pos_buf).view(1, 1, self.max_len)  # True = attend (read at replay)
         for li, ly in enumerate(self.layers):
             h = _rmsnorm(x, ly["in_ln"], self.eps)
-            q = (h @ ly["wq"].T).view(1, self.nh, self.hd).transpose(0, 1)
-            k = (h @ ly["wk"].T).view(1, self.nkv, self.hd).transpose(0, 1)
-            v = (h @ ly["wv"].T).view(1, self.nkv, self.hd).transpose(0, 1)
+            qkv = h @ ly["wqkv"].T
+            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+            q = q.view(1, self.nh, self.hd).transpose(0, 1)
+            k = k.view(1, self.nkv, self.hd).transpose(0, 1)
+            v = v.view(1, self.nkv, self.hd).transpose(0, 1)
             q = self._rope(_rmsnorm(q, ly["qn"], self.eps), cos, sin)
             k = self._rope(_rmsnorm(k, ly["kn"], self.eps), cos, sin)
             self.kc[li].index_copy_(0, self.pos_buf, k.transpose(0, 1))
@@ -125,7 +135,8 @@ class _GraphQwen3Runner:
             )
             x = x + ctx @ ly["wo"].T
             h2 = _rmsnorm(x, ly["post_ln"], self.eps)
-            x = x + (F.silu(h2 @ ly["wg"].T) * (h2 @ ly["wu"].T)) @ ly["wd"].T
+            gate, up = (h2 @ ly["wgu"].T).split([self.inter, self.inter], dim=-1)
+            x = x + (F.silu(gate) * up) @ ly["wd"].T
         x = _rmsnorm(x, self.final_norm, self.eps)
         return (x @ self.lm_head.T).float()
 

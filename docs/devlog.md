@@ -47,6 +47,25 @@ Plan (iterative, measure every step against the vLLM baseline):
 
 ## Log
 
+### 2026-06-26 — CUDA-graph custom Qwen3 executor BEATS vLLM on 0.6B
+
+Built the custom runner (`SOLORT_EXECUTOR=cudagraph`, `src/solort/model/cuda_graph_executor.py`):
+a hand-written graph-friendly Qwen3 forward over SoloRT-owned static KV (position from a buffer,
+SDPA attention, fused QKV + gate/up GEMMs), with the single-token decode captured once into a CUDA
+graph and replayed per token. Validated numerically correct (greedy == HF to bf16 precision).
+
+Single-stream decode, through the full server (records.md):
+- **Qwen3-0.6B: 164 tps vs vLLM 91 -> 1.80x (BEATS vLLM), ~13.7x the old HF path.**
+- Qwen3-4B: 45 tps vs vLLM 56 -> 0.81x, 4.1x old path.
+
+This realizes the launch-bound diagnosis: CUDA graphs eliminate the per-token kernel-launch cost
+that capped the HF bridge at ~12 tps and that torch.compile-on-HF could not fix. Iteration that got
+here: manual-attn 108.9/42.9 -> SDPA 157.7/44.5 -> fused GEMMs 164.0/45.2.
+
+Open frontier: 4B (needs paged FlashAttention computing only the live length + fused norms to pass
+vLLM), TTFT (prefill not yet graph-captured), and multi-sequence (currently single active sequence
+= the single-user target). Enable with `SOLORT_EXECUTOR=cudagraph SOLORT_GRAPH_MAX_LEN=...`.
+
 ### 2026-06-26 — torch.compile on HF Qwen3 is a dead end; custom runner required
 
 Tested torch.compile every way to get CUDA graphs onto the HF model:
