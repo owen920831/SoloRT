@@ -50,6 +50,11 @@ class _ServingState:
     generated_token_ids: list[int]
     decoded_text: str = ""
     finished: bool = False
+    # Incremental draft-model KV cache + the number of committed tokens it covers. The cache holds
+    # only the accepted prefix between speculative rounds; proposed tokens are cropped off because
+    # the target may reject them.
+    draft_past_key_values: object | None = None
+    draft_cached_len: int = 0
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,10 @@ class TransformersTextExecutor:
         self.speculative_proposed_tokens = 0
         self.speculative_accepted_tokens = 0
         self.speculative_rejected_tokens = 0
+        # Total tokens fed through the draft model. With the incremental draft KV cache this grows
+        # by ~accepted tokens per round instead of ~K x prefix_len, so it doubles as an efficiency
+        # signal for the speculative path.
+        self.speculative_draft_forward_tokens = 0
         self.kv_cache: PagedKVCache | None = None
 
         try:
@@ -161,6 +170,7 @@ class TransformersTextExecutor:
             "speculative_accepted_tokens": self.speculative_accepted_tokens,
             "speculative_rejected_tokens": self.speculative_rejected_tokens,
             "speculative_acceptance_rate": acceptance_rate,
+            "speculative_draft_forward_tokens": self.speculative_draft_forward_tokens,
             **self._attention_backend_snapshot(),
         }
 
@@ -402,20 +412,88 @@ class TransformersTextExecutor:
             return []
 
         device = self._draft_device()
-        draft_ids = list(sequence.input_ids) + list(state.generated_token_ids)
+        committed = list(sequence.input_ids) + list(state.generated_token_ids)
+        committed_len = len(committed)
+        if committed_len == 0:
+            return []
+
         proposed: list[int] = []
         with self._torch.inference_mode():
-            for _ in range(draft_count):
-                # This draft loop is intentionally simple and correctness-first. It does not yet
-                # keep a draft KV cache, which is why speculative speedup is modest in this bridge.
-                input_ids = self._torch.tensor([draft_ids], dtype=self._torch.long, device=device)
-                outputs = self.draft_model(input_ids=input_ids, use_cache=False)
-                token_id = self._greedy_token(outputs.logits[:, -1, :])
+            # Sync the draft cache to the accepted prefix, then propose K tokens one incremental
+            # forward at a time. The prefix is processed at most once per round (only the newly
+            # accepted tail), so a proposal round costs ~accepted tokens, not ~K x prefix_len.
+            logits = self._advance_draft_cache(state, committed, device)
+            for index in range(draft_count):
+                token_id = self._greedy_token(logits)
                 proposed.append(token_id)
-                draft_ids.append(token_id)
                 if token_id == self._eos_token_id() or token_id in sequence.stop_token_ids:
                     break
+                # Skip the forward after the final proposal: its logits would never be used.
+                if index + 1 >= draft_count:
+                    break
+                logits = self._draft_forward([token_id], state, device).logits[:, -1, :]
+        # Proposed tokens are provisional: the target may reject them, so they must not persist in
+        # the draft cache across rounds. Keep only the accepted committed prefix.
+        self._crop_draft_cache(state, committed_len)
         return proposed
+
+    def _advance_draft_cache(
+        self,
+        state: _ServingState,
+        committed: list[int],
+        device: object,
+    ) -> object:
+        """Extend the draft cache to cover ``committed`` and return next-token logits."""
+
+        committed_len = len(committed)
+        # Drop any stale speculative tail left over from a previous round.
+        if state.draft_cached_len > committed_len:
+            self._crop_draft_cache(state, committed_len)
+        tail = committed[state.draft_cached_len :]
+        if not tail:
+            # The cache already covers the full committed prefix but we need fresh logits for the
+            # next token; re-feed only the last committed token without duplicating earlier K/V.
+            self._crop_draft_cache(state, committed_len - 1)
+            tail = committed[committed_len - 1 :]
+        return self._draft_forward(tail, state, device).logits[:, -1, :]
+
+    def _draft_forward(
+        self,
+        token_ids: list[int],
+        state: _ServingState,
+        device: object,
+    ) -> object:
+        input_ids = self._torch.tensor([token_ids], dtype=self._torch.long, device=device)
+        outputs = self.draft_model(
+            input_ids=input_ids,
+            past_key_values=state.draft_past_key_values,
+            use_cache=True,
+        )
+        state.draft_past_key_values = outputs.past_key_values
+        state.draft_cached_len += len(token_ids)
+        self.speculative_draft_forward_tokens += len(token_ids)
+        return outputs
+
+    def _crop_draft_cache(self, state: _ServingState, length: int) -> None:
+        past = state.draft_past_key_values
+        if past is None:
+            state.draft_cached_len = 0
+            return
+        if length <= 0:
+            state.draft_past_key_values = None
+            state.draft_cached_len = 0
+            return
+        crop = getattr(past, "crop", None)
+        if callable(crop):
+            cropped = crop(length)
+            if cropped is not None:
+                state.draft_past_key_values = cropped
+            state.draft_cached_len = min(state.draft_cached_len, length)
+        else:
+            # The cache type cannot be truncated safely; rebuild from scratch next round so the
+            # draft proposals stay correct (at the cost of one full-prefix draft pass).
+            state.draft_past_key_values = None
+            state.draft_cached_len = 0
 
     def _speculative_enabled(self, sequence: Sequence, state: _ServingState) -> bool:
         if self.draft_model is None or self.config.speculative_tokens <= 0:
