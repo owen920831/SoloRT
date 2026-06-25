@@ -32,6 +32,20 @@ GPU experiments while the card is idle.
 
 ## Log
 
+### 2026-06-25 — GPU validation of KV mirror + finish the spec-off default
+
+Ran a GPU smoke test (spec off, `KV_TENSOR_STORAGE=1`) on the idle 4080:
+- Server starts clean and serves a coherent answer (`finish_reason=stop`) — the fallback fix and
+  per-layer KV tensor don't break real serving.
+- KV mirror fires end-to-end: `mirrored_tokens=2124, mirror_skipped=0, tensor_storage=allocated`
+  (~60 tokens x 36 layers). FlashInfer active (prefill=71, decode=1296, fallback=1).
+
+The test also caught that the **Dockerfiles/compose baked `ENV SOLORT_SPECULATIVE_TOKENS=4`**,
+which overrode the code default, so raw `docker run`/compose were still spec-on. Flipped those to
+`0` (Dockerfile.ngc, Dockerfile x2, docker-compose.yml). `make docker-ngc-up` already passes
+`-e ...=$(SPEC_TOKENS)=0` so the make path was already spec-off; raw `docker run` of an
+already-built image needs a rebuild to pick up the new baked default.
+
 ### 2026-06-25 — Paged executor step 1: KV read path + store/gather round-trip
 
 Toward the tensor-backed paged executor (one attention path for generate + validate). Added
