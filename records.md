@@ -1,5 +1,28 @@
 # Benchmark records
 
+## 2026-06-26 — Profiled the decode bottleneck; in-graph argmax (4B 45 -> 52 tps)
+
+Profiled the 4B cudagraph decode per-token (in-process, no HTTP):
+
+| phase                                   | ms/tok | tps  |
+| --------------------------------------- | ------ | ---- |
+| raw graph replay (no per-token sync)    | 17.8   | 56   |
+| + eager argmax over 151936 vocab + .item() | 22.1 | 45   |
+| in-graph argmax + .item() of 1 elem     | 16.9   | 59   |
+
+So the real bottleneck was NOT detokenize (~0 ms at 200 tokens) but the **eager argmax/`.float()`
+over the 151936-vocab each token (~5 ms), run on the CPU side with the GPU idle**. Moving the
+greedy argmax INTO the CUDA graph (pipelined on-GPU, read a 1-element token) removed it:
+
+| 4B path (through server)        | before | after in-graph argmax | vs vLLM 55.6 |
+| ------------------------------- | ------ | --------------------- | ------------ |
+| cudagraph target-only (greedy)  | 45.2   | 51.6                  | 0.93x        |
+| cudagraph + spec (K=3)          | 54.3   | 53.2                  | 0.96x        |
+
+(Isolated decode_argmax is 59 tps = 1.06x vLLM; the server still loses ~2.4 ms/token to
+async/SSE/HTTP + runtime per-token work, which is the next lever. With the per-token argmax cost
+gone, spec and target-only nearly converge — spec amortized exactly that cost.)
+
 ## 2026-06-26 — Speculative decoding on the cudagraph runner (4B beats/ties vLLM)
 
 `SOLORT_EXECUTOR=cudagraph SOLORT_SPECULATIVE_TOKENS=3` (4B target + 0.6B draft). Both models run
