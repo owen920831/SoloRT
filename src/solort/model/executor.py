@@ -53,7 +53,9 @@ class TransformersGenerationConfig:
     # which is the real lever. Incompatible with the FlashInfer bridge and speculative decoding.
     use_static_cache: bool = False
     # Max sequence length (prompt + generation) for the CUDA-graph executor's static KV buffers.
-    graph_max_len: int = 2048
+    # Decode graphs are bucketed (attention scans only the live length), but a larger buffer still
+    # costs memory locality, so 1024 balances context vs speed for interactive use.
+    graph_max_len: int = 1024
 
 
 @dataclass

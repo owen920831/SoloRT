@@ -360,7 +360,7 @@ def build_default_runtime() -> RuntimeCore:
             speculative_draft_device_map=os.getenv("SOLORT_SPECULATIVE_DRAFT_DEVICE_MAP"),
             attention_backend=os.getenv("SOLORT_ATTENTION_BACKEND", default_backend),
             use_static_cache=use_static_cache,
-            graph_max_len=_env_int("SOLORT_GRAPH_MAX_LEN", default=2048),
+            graph_max_len=_env_int("SOLORT_GRAPH_MAX_LEN", default=1024),
         )
     )
     kv_cache = _build_runtime_kv_cache(executor)

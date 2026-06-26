@@ -70,9 +70,14 @@ class _GraphQwen3Runner:
         self.tok_buf = torch.zeros(1, dtype=torch.long, device=self.dev)
         self.pos_buf = torch.zeros(1, dtype=torch.long, device=self.dev)
         self.arange = torch.arange(self.max_len, device=self.dev)
-        self.graph: torch.cuda.CUDAGraph | None = None
-        self._logits: torch.Tensor | None = None
-        self._tok: torch.Tensor | None = None  # in-graph greedy argmax (avoids eager vocab argmax)
+        # Bucketed decode graphs: attention scans only `bound` keys (not the full max_len), so short
+        # sequences are much cheaper. One graph per bucket, captured lazily, routed by position.
+        self.buckets = sorted(
+            {b for b in (128, 256, 512, 1024, 2048, 4096) if b < self.max_len} | {self.max_len}
+        )
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._logits: dict[int, torch.Tensor] = {}
+        self._tok: dict[int, torch.Tensor] = {}  # in-graph greedy argmax per bucket
         # Verify graph (fixed K+1 tokens) for speculative decoding; lazily captured.
         self.verify_graph: torch.cuda.CUDAGraph | None = None
         self.vtok: torch.Tensor | None = None
@@ -118,10 +123,10 @@ class _GraphQwen3Runner:
         x = _rmsnorm(x, self.final_norm, self.eps)
         return (x[-1:] @ self.lm_head.T).float()
 
-    def _decode_forward(self) -> torch.Tensor:
+    def _decode_forward(self, bound: int) -> torch.Tensor:
         cos, sin = self._cos_sin(self.pos_buf)
         x = self.embed[self.tok_buf].to(self.dt)
-        keep = (self.arange <= self.pos_buf).view(1, 1, self.max_len)  # True=attend (read @ replay)
+        keep = (self.arange[:bound] <= self.pos_buf).view(1, 1, bound)  # only scan `bound` keys
         for li, ly in enumerate(self.layers):
             h = _rmsnorm(x, ly["in_ln"], self.eps)
             qkv = h @ ly["wqkv"].T
@@ -133,8 +138,8 @@ class _GraphQwen3Runner:
             k = self._rope(_rmsnorm(k, ly["kn"], self.eps), cos, sin)
             self.kc[li].index_copy_(0, self.pos_buf, k.transpose(0, 1))
             self.vc[li].index_copy_(0, self.pos_buf, v.transpose(0, 1))
-            kk = self.kc[li].permute(1, 0, 2).repeat_interleave(self.groups, 0)
-            vv = self.vc[li].permute(1, 0, 2).repeat_interleave(self.groups, 0)
+            kk = self.kc[li, :bound].permute(1, 0, 2).repeat_interleave(self.groups, 0)
+            vv = self.vc[li, :bound].permute(1, 0, 2).repeat_interleave(self.groups, 0)
             ctx = (
                 F.scaled_dot_product_attention(q, kk, vv, attn_mask=keep, scale=self.scale)
                 .transpose(0, 1)
@@ -147,49 +152,49 @@ class _GraphQwen3Runner:
         x = _rmsnorm(x, self.final_norm, self.eps)
         return (x @ self.lm_head.T).float()
 
-    def capture(self) -> None:
+    def _bucket_for(self, pos: int) -> int:
+        return next(b for b in self.buckets if b > pos)
+
+    def _capture(self, bound: int) -> None:
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(3):
-                self._logits = self._decode_forward()
-                self._tok = self._logits.argmax(-1)
+                lg = self._decode_forward(bound)
+                tk = lg.argmax(-1)
         torch.cuda.current_stream().wait_stream(stream)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self._logits = self._decode_forward()
-            self._tok = self._logits.argmax(-1)  # greedy argmax on-GPU, pipelined in the graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            lg = self._decode_forward(bound)
+            tk = lg.argmax(-1)  # greedy argmax on-GPU, pipelined in the graph
+        self._graphs[bound], self._logits[bound], self._tok[bound] = graph, lg, tk
+
+    def _replay(self, pos: int) -> int:
+        bound = self._bucket_for(pos)
+        if bound not in self._graphs:
+            self._capture(bound)
+        self._graphs[bound].replay()
+        return bound
 
     def decode(self, token: int, pos: int) -> torch.Tensor:
         self.tok_buf.fill_(int(token))
         self.pos_buf.fill_(int(pos))
-        if self.graph is None:
-            self.capture()
-        self.graph.replay()
-        return self._logits
+        return self._logits[self._replay(pos)]
 
     def decode_argmax(self, token: int, pos: int) -> int:
         """Greedy decode reading the in-graph argmax (no eager argmax over the vocab)."""
         self.tok_buf.fill_(int(token))
         self.pos_buf.fill_(int(pos))
-        if self.graph is None:
-            self.capture()
-        self.graph.replay()
-        return int(self._tok.item())
+        return int(self._tok[self._replay(pos)].item())
 
     def decode_gpu(self, tok_t: torch.Tensor, pos: int) -> torch.Tensor:
         """Decode from a GPU-resident token (no CPU sync); returns next-token argmax [1] on GPU.
 
         Used by the speculative draft loop so the K draft replays pipeline back-to-back without a
         GPU->CPU flush between them."""
-        if self.graph is None:
-            self.tok_buf.fill_(int(tok_t.item()))
-            self.pos_buf.fill_(int(pos))
-            self.capture()
         self.tok_buf.copy_(tok_t.view(1))
         self.pos_buf.fill_(int(pos))
-        self.graph.replay()
-        return self._logits.argmax(-1)
+        return self._logits[self._replay(pos)].argmax(-1)
 
     def _verify_forward(self) -> torch.Tensor:
         k1 = self.vtok.shape[0]

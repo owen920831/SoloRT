@@ -1,5 +1,25 @@
 # Benchmark records
 
+## 2026-06-26 — Bucketed decode graphs: 0.6B 2.02x vLLM, 4B parity-to-1.19x
+
+cProfile of the decode loop settled the bottleneck: 88% of time is `.item()` blocking on the GPU
+graph (the model forward); Python is ~4%. So it is GPU-compute bound and "fully on GPU" already.
+The one remaining GPU waste was attention scanning the full `graph_max_len` each step (SDPA does not
+skip masked keys). Fix = **bucketed CUDA graphs** (vLLM-style): one decode graph per length bucket
+(128/256/512/1024/...), routed by position, so attention scans only ~live length.
+
+| path (through server, greedy)     | decode tps | vs vLLM (0.6B 91 / 4B 55.6) |
+| ---------------------------------- | ---------- | --------------------------- |
+| 0.6B cudagraph (bucketed)          | 183        | **2.02x**                   |
+| 4B  cudagraph, graph_max_len=256   | 66         | 1.19x                       |
+| 4B  cudagraph, graph_max_len=1024  | 55         | 1.00x (parity)              |
+| 4B  cudagraph, graph_max_len=2048  | 54         | 0.97x                       |
+
+Note: even with bucketing (same ~256-key scan), a larger KV buffer is slower (256->66, 1024->55,
+2048->54) — the buffer size itself costs memory locality. Default set to graph_max_len=1024
+(context vs speed balance). So 4B is parity-to-winning vs vLLM depending on context length, 0.6B
+wins decisively, both greedy + exact.
+
 ## 2026-06-26 — Profiled the decode bottleneck; in-graph argmax (4B 45 -> 52 tps)
 
 Profiled the 4B cudagraph decode per-token (in-process, no HTTP):
