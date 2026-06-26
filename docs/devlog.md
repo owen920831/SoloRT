@@ -55,13 +55,19 @@ Plan (iterative, measure every step against the vLLM baseline):
 - Exact state now: 0.6B ~150-180 tps & 11-13ms TTFT (1.6-2.0x vLLM); 4B 67 tps & 27ms TTFT (1.21x).
   SoloRT beats vLLM on both models, decode AND TTFT, exact greedy.
 
-**Quantization frontier (investigated, blocked on torch 2.4):** batch-1 decode is weight-memory
-bound (~73% of the bf16 roofline) so smaller weights are the next big lever, but
-`torch._weight_int8pack_mm` is CPU-only here, and `torch._scaled_mm` fp8 supports only per-tensor
-scalar scales in 2.4 (per-row needs >=2.5) -> ~94% error, unusable. Proper per-channel int8/fp8
-needs torch>=2.5 / torchao / a custom CUDA kernel (a new-image build) and is non-exact. So the exact
-path is at its practical limit on this infra; exceeding the bf16 roofline is a deliberate
-speed-vs-fidelity step (quantization) gated on that upgrade.
+**Quantization frontier (thoroughly investigated, no fast path on torch 2.4 + Ada):** batch-1 decode
+is weight-memory bound (~73% of the bf16 roofline) so smaller weights are the next big lever. Tried
+all three avenues, all blocked:
+- `torch._weight_int8pack_mm`: CPU-only (no CUDA kernel in 2.4).
+- `torch._scaled_mm` fp8: per-tensor scalar scales only in 2.4 (per-row needs >=2.5) -> ~94% error.
+- **torchao int8_weight_only**: accurate (0.5% error) but **2-5x SLOWER** on the 4080 (no tuned
+  Ada/torch-2.4 kernel; it doesn't realize the memory-bandwidth saving here).
+
+So there is no working *fast* quantization kernel on this hardware/software, and the exact bf16 path
+(which already beats vLLM) is the practical optimum here. Exceeding the bf16 roofline would need a
+newer-torch image with a tuned Ada int8/fp8 decode kernel (e.g. Marlin/Machete-style) -- a major
+infra project, non-exact, and with uncertain payoff on Ada. Conclusion: the exact single-stream
+runtime is optimized to its practical limit on this setup.
 
 ### 2026-06-26 — Speculative decoding on the cudagraph runner (4B)
 
