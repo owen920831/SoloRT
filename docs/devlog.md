@@ -47,6 +47,22 @@ Plan (iterative, measure every step against the vLLM baseline):
 
 ## Log
 
+### 2026-06-26 — Speculative decoding on the cudagraph runner (4B)
+
+Added exact greedy speculative decoding to the cudagraph executor (`SpecCudaGraphQwen3Executor`,
+`SOLORT_EXECUTOR=cudagraph SOLORT_SPECULATIVE_TOKENS=K`): 0.6B draft + 4B target, both CUDA-graphed.
+The draft proposes K tokens (graph decode, kept on-GPU to avoid per-step sync), the target verifies
+K+1 tokens in one graphed `verify` forward, accept the longest matching prefix + correction/bonus.
+
+Because verify uses the same kernel as decode, spec output is EXACT vs target greedy (96/96) — the
+HF bridge couldn't do this (prefill vs decode kernels diverged). And because the draft is graph'd
+(fast), spec now HELPS instead of being a 2.3x loss:
+- 4B isolated: target-only 49 -> spec(K=3) 60.9 tps (1.10x vLLM, 1.27x target-only).
+- 4B through server: 45 -> 54.3 tps (0.98x vLLM, 1.20x target-only). Exact, coherent.
+
+Greedy + rep_penalty==1.0 only (else single-token). Frontier: serving-overhead per token (spec
+gain shrinks through streaming), TTFT (graph-capture prefill), paged decode to beat 4B cleanly.
+
 ### 2026-06-26 — CUDA-graph custom Qwen3 executor BEATS vLLM on 0.6B
 
 Built the custom runner (`SOLORT_EXECUTOR=cudagraph`, `src/solort/model/cuda_graph_executor.py`):

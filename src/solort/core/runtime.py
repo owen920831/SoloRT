@@ -325,9 +325,15 @@ def build_default_runtime() -> RuntimeCore:
         executor_cls = TransformersTextExecutor
         default_backend = "auto"
     elif executor_name in {"cudagraph", "cuda-graph", "graph"}:
-        from solort.model.cuda_graph_executor import CudaGraphQwen3Executor
+        from solort.model.cuda_graph_executor import (
+            CudaGraphQwen3Executor,
+            SpecCudaGraphQwen3Executor,
+        )
 
-        executor_cls = CudaGraphQwen3Executor
+        if _env_int("SOLORT_SPECULATIVE_TOKENS", default=0) > 0:
+            executor_cls = SpecCudaGraphQwen3Executor  # cudagraph + speculative decoding
+        else:
+            executor_cls = CudaGraphQwen3Executor
         default_backend = "sdpa"
     else:
         raise ValueError(f"unknown SOLORT_EXECUTOR={executor_name!r}")

@@ -71,6 +71,11 @@ class _GraphQwen3Runner:
         self.arange = torch.arange(self.max_len, device=self.dev)
         self.graph: torch.cuda.CUDAGraph | None = None
         self._logits: torch.Tensor | None = None
+        # Verify graph (fixed K+1 tokens) for speculative decoding; lazily captured.
+        self.verify_graph: torch.cuda.CUDAGraph | None = None
+        self.vtok: torch.Tensor | None = None
+        self.vpos0: torch.Tensor | None = None
+        self._vlogits: torch.Tensor | None = None
 
     def _cos_sin(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         freqs = positions[:, None].float() * self.inv_freq[None, :]
@@ -114,7 +119,7 @@ class _GraphQwen3Runner:
     def _decode_forward(self) -> torch.Tensor:
         cos, sin = self._cos_sin(self.pos_buf)
         x = self.embed[self.tok_buf].to(self.dt)
-        keep = (self.arange <= self.pos_buf).view(1, 1, self.max_len)  # True = attend (read at replay)
+        keep = (self.arange <= self.pos_buf).view(1, 1, self.max_len)  # True=attend (read @ replay)
         for li, ly in enumerate(self.layers):
             h = _rmsnorm(x, ly["in_ln"], self.eps)
             qkv = h @ ly["wqkv"].T
@@ -158,6 +163,66 @@ class _GraphQwen3Runner:
             self.capture()
         self.graph.replay()
         return self._logits
+
+    def decode_gpu(self, tok_t: torch.Tensor, pos: int) -> torch.Tensor:
+        """Decode from a GPU-resident token (no CPU sync); returns next-token argmax [1] on GPU.
+
+        Used by the speculative draft loop so the K draft replays pipeline back-to-back without a
+        GPU->CPU flush between them."""
+        if self.graph is None:
+            self.tok_buf.fill_(int(tok_t.item()))
+            self.pos_buf.fill_(int(pos))
+            self.capture()
+        self.tok_buf.copy_(tok_t.view(1))
+        self.pos_buf.fill_(int(pos))
+        self.graph.replay()
+        return self._logits.argmax(-1)
+
+    def _verify_forward(self) -> torch.Tensor:
+        k1 = self.vtok.shape[0]
+        pos = self.vpos0 + torch.arange(k1, device=self.dev)
+        cos, sin = self._cos_sin(pos)
+        x = self.embed[self.vtok].to(self.dt)
+        keep = (self.arange[None, :] <= pos[:, None]).view(1, k1, self.max_len)
+        for li, ly in enumerate(self.layers):
+            h = _rmsnorm(x, ly["in_ln"], self.eps)
+            q, k, v = (h @ ly["wqkv"].T).split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+            q = q.view(k1, self.nh, self.hd).transpose(0, 1)
+            k = k.view(k1, self.nkv, self.hd).transpose(0, 1)
+            v = v.view(k1, self.nkv, self.hd).transpose(0, 1)
+            q = self._rope(_rmsnorm(q, ly["qn"], self.eps), cos, sin)
+            k = self._rope(_rmsnorm(k, ly["kn"], self.eps), cos, sin)
+            self.kc[li].index_copy_(0, pos, k.transpose(0, 1))
+            self.vc[li].index_copy_(0, pos, v.transpose(0, 1))
+            kk = self.kc[li].permute(1, 0, 2).repeat_interleave(self.groups, 0)
+            vv = self.vc[li].permute(1, 0, 2).repeat_interleave(self.groups, 0)
+            ctx = F.scaled_dot_product_attention(q, kk, vv, attn_mask=keep, scale=self.scale)
+            x = x + ctx.transpose(0, 1).reshape(k1, self.nh * self.hd) @ ly["wo"].T
+            h2 = _rmsnorm(x, ly["post_ln"], self.eps)
+            gate, up = (h2 @ ly["wgu"].T).split([self.inter, self.inter], dim=-1)
+            x = x + (F.silu(gate) * up) @ ly["wd"].T
+        return (_rmsnorm(x, self.final_norm, self.eps) @ self.lm_head.T).float()
+
+    def verify(self, tok_t: torch.Tensor, pos_start: int) -> torch.Tensor:
+        """Score K+1 GPU tokens at [pos_start..pos_start+K]; logits [K+1, vocab]."""
+        if self.verify_graph is None:
+            self.vtok = torch.zeros(tok_t.shape[0], dtype=torch.long, device=self.dev)
+            self.vpos0 = torch.zeros(1, dtype=torch.long, device=self.dev)
+            self.vtok.copy_(tok_t)
+            self.vpos0.fill_(int(pos_start))
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    self._vlogits = self._verify_forward()
+            torch.cuda.current_stream().wait_stream(stream)
+            self.verify_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.verify_graph):
+                self._vlogits = self._verify_forward()
+        self.vtok.copy_(tok_t)
+        self.vpos0.fill_(int(pos_start))
+        self.verify_graph.replay()
+        return self._vlogits
 
 
 class CudaGraphQwen3Executor(TransformersTextExecutor):
@@ -219,3 +284,98 @@ class CudaGraphQwen3Executor(TransformersTextExecutor):
         token_id = int(state.pending_token_id if state.pending_token_id is not None else 0)
         state.pending_token_id = None
         return self._append_token_result(sequence, state, token_id)
+
+
+class SpecCudaGraphQwen3Executor(CudaGraphQwen3Executor):
+    """CUDA-graph executor with exact greedy speculative decoding (0.6B draft -> 4B target).
+
+    Both models run as CUDA graphs, so the draft is cheap and the target verifies K+1 tokens in one
+    graphed forward. Unlike the HF bridge (where spec was a 2.3x loss), this beats the target-only
+    cudagraph path and edges past vLLM on 4B. Greedy + repetition_penalty==1.0 only (exactness);
+    other requests fall back to single-token decode.
+    """
+
+    name = "cudagraph-qwen3-spec"
+
+    def __init__(self, config: TransformersGenerationConfig | None = None) -> None:
+        super().__init__(config)
+        self._spec_k = max(1, int(self.config.speculative_tokens))
+        from transformers import AutoModelForCausalLM
+
+        kwargs = self._model_kwargs()
+        try:
+            draft = AutoModelForCausalLM.from_pretrained(
+                self.config.speculative_draft_model_id,
+                trust_remote_code=self.config.trust_remote_code,
+                **kwargs,
+            )
+        except TypeError:
+            if "dtype" in kwargs:
+                kwargs["torch_dtype"] = kwargs.pop("dtype")
+            draft = AutoModelForCausalLM.from_pretrained(
+                self.config.speculative_draft_model_id,
+                trust_remote_code=self.config.trust_remote_code,
+                **kwargs,
+            )
+        draft.eval()
+        if not hasattr(draft.model.layers[0].self_attn, "q_norm"):
+            raise RuntimeError("speculative draft must be a Qwen3-family model")
+        self._draft = _GraphQwen3Runner(draft, self._max_len)
+
+    def forward_prefill(self, batch: Batch) -> None:
+        super().forward_prefill(batch)
+        sequence = batch.seqs[0]
+        state = self._states.get(sequence.seq_id)
+        if state is None or state.pending_token_id is None:
+            return
+        if getattr(state, "_draft_prefilled", False):
+            return
+        prompt = sequence.input_ids[: sequence.num_prompt_tokens]
+        ids = self._torch.tensor(prompt, dtype=self._torch.long, device=self._model_device())
+        with self._torch.no_grad():
+            self._draft.prefill(ids)
+        state._draft_prefilled = True
+
+    def forward_decode(self, batch: Batch) -> SampleResult | list[SampleResult]:
+        sequence = batch.seqs[0]
+        state = self._ensure_state(sequence)
+        if state.finished:
+            return SampleResult(token_id=self._eos_token_id(), text="", finished=True)
+        if state.pending_token_id is not None or not state.generated_token_ids:
+            return super().forward_decode(batch)
+        temperature = float(sequence.metadata.get("temperature", self.config.default_temperature))
+        rep = float(
+            sequence.metadata.get("repetition_penalty", self.config.default_repetition_penalty)
+        )
+        position = state.prompt_token_count + len(state.generated_token_ids)
+        # Exact greedy spec only; otherwise single-token decode (handles sampling + rep penalty).
+        if temperature > 0 or rep != 1.0 or position + self._spec_k + 2 >= self._max_len:
+            return super().forward_decode(batch)
+        new_tokens = self._spec_round(state.generated_token_ids[-1], position)
+        results: list[SampleResult] = []
+        for token_id in new_tokens:
+            results.append(self._append_token_result(sequence, state, token_id))
+            if state.finished:
+                break
+        return results
+
+    def _spec_round(self, last_token: int, n: int) -> list[int]:
+        torch = self._torch
+        k = self._spec_k
+        with torch.no_grad():
+            t_gpu = torch.tensor([last_token], dtype=torch.long, device=self._model_device())
+            drafts = []
+            cur, pos = t_gpu, n
+            for _ in range(k):
+                cur = self._draft.decode_gpu(cur, pos)
+                drafts.append(cur)
+                pos += 1
+            draft_vec = torch.cat(drafts)  # [k]
+            tg = self._runner.verify(torch.cat([t_gpu, draft_vec]), n).argmax(-1)  # [k+1]
+            a = int((tg[:k] == draft_vec).cumprod(0).sum().item())
+            if a == k:
+                out = torch.cat([draft_vec, tg[k : k + 1]]).tolist()
+                self._draft.decode_gpu(draft_vec[k - 1 : k], n + k)  # dK draft KV continuity
+            else:
+                out = torch.cat([draft_vec[:a], tg[a : a + 1]]).tolist()
+        return out

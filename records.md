@@ -1,5 +1,26 @@
 # Benchmark records
 
+## 2026-06-26 — Speculative decoding on the cudagraph runner (4B beats/ties vLLM)
+
+`SOLORT_EXECUTOR=cudagraph SOLORT_SPECULATIVE_TOKENS=3` (4B target + 0.6B draft). Both models run
+as CUDA graphs, so the draft is cheap and the target verifies K+1 tokens in one graphed forward
+(`verify` graph). The draft proposal loop keeps tokens on-GPU (no per-step `.item()` sync) so the K
+draft replays pipeline. Exact greedy (verify uses the same kernel as decode -> spec output == target
+greedy, validated 96/96). Greedy + repetition_penalty==1.0 only; else single-token decode.
+
+| 4B path                          | isolated tps | through server | vs vLLM (55.6) |
+| -------------------------------- | ------------ | -------------- | -------------- |
+| cudagraph target-only            | 49           | 45             | 0.81x          |
+| cudagraph + spec (K=3, 0.6B draft) | 60.9       | 54.3           | 1.10x / 0.98x  |
+
+So speculative decoding now **helps** (1.2-1.3x over target-only cudagraph) instead of being a 2.3x
+loss as on the HF bridge — because the draft is graph'd and fast. K sweep (isolated): K=3 60.9 best,
+K=4 59.5, K=6 59.0. Acceptance ~0.6-0.76, ~2.3-3.3 accepted/round. TTFT is higher (164ms: draft
+prefill + first-request graph captures).
+
+Frontier to clearly beat vLLM on 4B through the server: cut per-token serving overhead (the spec
+gain shrinks 60.9->54.3 through streaming), graph-capture prefill (TTFT), and a paged decode kernel.
+
 ## 2026-06-26 — CUDA-graph custom Qwen3 executor BEATS vLLM on 0.6B
 
 `SOLORT_EXECUTOR=cudagraph`: a hand-written, graph-friendly Qwen3 forward over SoloRT-owned static
