@@ -1,9 +1,38 @@
 # SoloRT Architecture
 
-SoloRT is a single-user, single-GPU runtime optimized for interactive local chat. The v1 real-model
-target is `Qwen/Qwen3-4B`; `Qwen/Qwen3-0.6B` is the default greedy speculative draft model.
+SoloRT is a single-user, single-GPU runtime optimized for interactive local chat on consumer NVIDIA
+GPUs. It has two execution paths behind one OpenAI-compatible API and scheduler:
 
-## Serving Data Flow
+- **`cudagraph` (fast path)** — a custom, CUDA-graph Qwen3 forward that beats vLLM single-stream
+  (see below). Single active sequence, Qwen3-family + CUDA, exact greedy.
+- **`paged` / `transformers` (general path)** — a HuggingFace-Transformers bridge with SoloRT
+  scheduling, paged-KV metadata, prefix cache, and a FlashInfer attention option. Works for any HF
+  causal LM. The rest of this document describes this path's KV/scheduling machinery, which the
+  fast path bypasses with its own static KV.
+
+## CUDA-Graph Fast Path
+
+The interactive batch-1 decode is kernel-launch / weight-memory bound, not compute bound, so the
+fast path removes per-token CPU and launch overhead:
+
+```mermaid
+flowchart TD
+    P[Prompt] --> PF[Graphed bucketed prefill<br/>pad to length bucket, one captured causal graph]
+    PF --> KV[SoloRT-owned static KV per layer]
+    PF --> T0[first token]
+    T0 --> DEC[Graphed bucketed decode<br/>scan only live length]
+    DEC --> AM[On-GPU greedy argmax in-graph]
+    AM --> TOK[token]
+    TOK --> DEC
+    KV --> DEC
+```
+
+Key techniques (`src/solort/model/cuda_graph_executor.py`): CUDA-graph capture of prefill and the
+single-token decode (bucketed by length); on-GPU argmax inside the graph (no eager vocab argmax);
+grouped-query attention without materializing the GQA-expanded KV (no `repeat_interleave`); fused
+QKV / gate-up GEMMs; incremental detokenization. Numbers in [../records.md](../records.md).
+
+## Serving Data Flow (general `paged` path)
 
 ```mermaid
 flowchart TD

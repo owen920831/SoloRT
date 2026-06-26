@@ -906,17 +906,6 @@ def messages_to_metadata(messages: Iterable[Message]) -> list[dict[str, str]]:
     return [{"role": message.role, "content": message.content} for message in messages]
 
 
-def _text_delta(previous_text: str, new_text: str) -> str:
-    if new_text.startswith(previous_text):
-        return new_text[len(previous_text) :]
-
-    common = 0
-    max_common = min(len(previous_text), len(new_text))
-    while common < max_common and previous_text[common] == new_text[common]:
-        common += 1
-    return new_text[common:]
-
-
 def _dtype_name(dtype: object | None) -> str:
     text = str(dtype or "float16").replace("torch.", "")
     if text == "float16":

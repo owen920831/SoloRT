@@ -8,7 +8,6 @@ from solort.model.executor import (
     TransformersGenerationConfig,
     TransformersTextExecutor,
     _ServingState,
-    _text_delta,
 )
 
 
@@ -167,14 +166,6 @@ def test_draft_vocab_guard_rejects_mismatched_vocab() -> None:
     executor = _vocab_executor(151_936)
     draft = types.SimpleNamespace(config=types.SimpleNamespace(vocab_size=32_000))
     assert executor._draft_vocab_compatible(draft) is False
-
-
-def test_text_delta_uses_simple_suffix_when_text_is_stable() -> None:
-    assert _text_delta("你好", "你好 SoloRT") == " SoloRT"
-
-
-def test_text_delta_recovers_when_tokenizer_rewrites_prefix() -> None:
-    assert _text_delta("hello world", "hello, world!") == ", world!"
 
 
 def test_repeated_token_run_guard_detects_degenerate_tail() -> None:
