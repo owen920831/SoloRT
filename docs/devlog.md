@@ -47,6 +47,22 @@ Plan (iterative, measure every step against the vLLM baseline):
 
 ## Log
 
+### 2026-06-26 — Optimization pass 2: prefill graph, grouped attention; quant frontier
+
+- **Graphed bucketed prefill**: TTFT 74ms -> 20ms (prefill was eager / launch-bound). Beats vLLM.
+- **Grouped decode attention** (drop the GQA repeat_interleave; read cache as [nkv,bound,hd]):
+  4B decode 55 -> 67 tps (1.21x vLLM) at 1024 context; also fixes the large-KV-buffer slowdown.
+- Exact state now: 0.6B ~150-180 tps & 11-13ms TTFT (1.6-2.0x vLLM); 4B 67 tps & 27ms TTFT (1.21x).
+  SoloRT beats vLLM on both models, decode AND TTFT, exact greedy.
+
+**Quantization frontier (investigated, blocked on torch 2.4):** batch-1 decode is weight-memory
+bound (~73% of the bf16 roofline) so smaller weights are the next big lever, but
+`torch._weight_int8pack_mm` is CPU-only here, and `torch._scaled_mm` fp8 supports only per-tensor
+scalar scales in 2.4 (per-row needs >=2.5) -> ~94% error, unusable. Proper per-channel int8/fp8
+needs torch>=2.5 / torchao / a custom CUDA kernel (a new-image build) and is non-exact. So the exact
+path is at its practical limit on this infra; exceeding the bf16 roofline is a deliberate
+speed-vs-fidelity step (quantization) gated on that upgrade.
+
 ### 2026-06-26 — Speculative decoding on the cudagraph runner (4B)
 
 Added exact greedy speculative decoding to the cudagraph executor (`SpecCudaGraphQwen3Executor`,
