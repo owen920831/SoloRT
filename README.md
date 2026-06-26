@@ -142,8 +142,10 @@ the host PyTorch CUDA build, GPU work runs inside that container, not on the hos
   chunked prefill/decode, paged-KV metadata, block-hash prefix cache, Qwen3 HF bridge. ✅
 - Phase 2 — CUDA-graph fast path: custom Qwen3 forward, graphed prefill+decode, on-GPU argmax,
   grouped attention. ✅ (beats vLLM single-stream)
-- Phase 3 — Quantization: a tuned Ada int8/fp8 weight-only decode kernel to pass the bf16 roofline
-  (needs newer-torch infra; a deliberate speed-vs-fidelity step). Investigated; see devlog.
+- Phase 3 — Quantization: re-probed on a driver-safe torch 2.6 image (`Dockerfile.quant`). Verdict:
+  weight-only int4/int8/fp8 are all *slower* than bf16 at batch-1 on Ada (the decode GEMM is a GEMV
+  cuBLAS already runs near-optimally); the only win is int4 on the large lm_head (~6% on 4B,
+  non-exact). A general quant speedup needs a Marlin-class small-N kernel. See records/devlog.
 - Phase 4 — Multi-sequence / longer context for the cudagraph path.
 
 ## Benchmarks

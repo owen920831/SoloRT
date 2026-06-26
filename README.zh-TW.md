@@ -137,8 +137,10 @@ GPU 工作會在該容器內執行,而非主機上。
   metadata、block-hash prefix cache、Qwen3 HF 橋接。✅
 - 階段 2 —— CUDA-graph 快速路徑:自訂 Qwen3 前向、graph 化 prefill+decode、on-GPU argmax、grouped
   attention。✅(單流勝過 vLLM)
-- 階段 3 —— 量化:調校過的 Ada int8/fp8 weight-only 解碼 kernel 以突破 bf16 roofline(需要較新的 torch
-  基礎設施;這是速度對精度的取捨)。已調查,詳見 devlog。
+- 階段 3 —— 量化:已在 driver 相容的 torch 2.6 映像(`Dockerfile.quant`)重新驗證。結論:在 Ada 的
+  batch-1 下,weight-only int4/int8/fp8 全都比 bf16 慢(解碼 GEMM 在 M=1 是 GEMV,cuBLAS 已接近最佳);
+  唯一有利的是對大型 lm_head 做 int4(4B 約 +6%,非精確)。一般性的量化加速需要 Marlin 等級的 small-N
+  kernel。詳見 records/devlog。
 - 階段 4 —— cudagraph 路徑的多序列 / 更長上下文支援。
 
 ## Benchmark

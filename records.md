@@ -1,5 +1,37 @@
 # Benchmark records
 
+## 2026-06-26 — Quantization re-probe on torch 2.6: still GEMV-bound, no general win
+
+Built a driver-safe torch 2.6 + cu124 image (`Dockerfile.quant`, torchao 0.9.0) to retry the lever
+that torch 2.4 blocked. Isolated batch-1 (M=1) GEMM probe over the 4B's real decode shapes
+(`scripts/probe_quant_gemm.py`, RTX 4080 / sm_89), per-token GEMM latency summed over all layers:
+
+| recipe   | per-token GEMM | vs bf16 | max rel err |
+| -------- | -------------- | ------- | ----------- |
+| bf16     | 11.86 ms       | 1.00x   | -           |
+| int4_wo  | 23.46 ms       | 0.51x   | 0.082       |
+| int8_wo  | 32.33 ms       | 0.37x   | 0.007       |
+| fp8_wo   | 59.44 ms       | 0.20x   | 0.028       |
+
+**All weight-only recipes are SLOWER overall** — at M=1 the decode GEMM is a GEMV where bf16 cuBLAS
+is already near memory-optimal, while the quant kernels pay dequant ALU + packed-layout overhead with
+no compute to hide it behind. torch 2.6 does not change the torch-2.4 conclusion.
+
+The one exception is **N-dependent**: int4 tinygemm (`_weight_int4pack_mm`, the gpt-fast kernel) only
+beats bf16 when the output dim is very large —
+
+| GEMM     | N       | int4 vs bf16 |
+| -------- | ------- | ------------ |
+| lm_head  | 151,936 | **3.82x**    |
+| gate_up  | 19,456  | 0.98x        |
+| down/o/qkv | <=6,144 | 0.17-0.54x |
+
+So the only realizable quant win on this GPU at batch-1 is **int4 on the lm_head alone**: 1.46 -> 0.38
+ms (saves ~1.08 ms/token, ~6% of 4B decode), at the cost of exactness (logit err ~7% -> approximate
+greedy). The per-layer GEMMs are too small-N for any low-batch quant kernel to beat cuBLAS bf16. A
+general 1.5-2x quant speedup is not available on Ada at batch-1 without a Marlin-class kernel tuned
+for these small-N shapes (which torchao/torch do not ship).
+
 ## 2026-06-26 — Chunked greedy decode: 0.6B 149 -> 160 tps (+7%); 4B neutral
 
 After moving the argmax on-GPU, the records pinned the residual ~2.4 ms/token to RuntimeCore/executor

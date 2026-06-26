@@ -153,6 +153,19 @@ thrashes, the next iteration builds a SoloRT image on torch >=2.6 (cu124, driver
 enables `torch.compile(reduce-overhead)` + StaticCache on the decode path, measured vs the vLLM
 baseline.
 
+### 2026-06-26 — Quantization re-probe on torch 2.6 (driver-safe image): no general win
+
+Retried the quantization lever that torch 2.4 blocked. Built `Dockerfile.quant`
+(`pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel` + torchao 0.9.0) — cu124 runtime is driver-safe on
+the 12.6 / 560.94 host, where NGC 25.x's CUDA 12.8 would need driver 570+. An isolated batch-1 GEMM
+probe (`scripts/probe_quant_gemm.py`) over the 4B's real decode shapes settled it: every weight-only
+recipe is slower overall (int4 0.51x, int8 0.37x, fp8 0.20x). At M=1 the decode GEMM is a GEMV and
+bf16 cuBLAS is already near memory-optimal; the quant kernels are dequant/overhead-bound. The only
+exception is N-dependent — int4 tinygemm beats bf16 only at very large output dims (lm_head 3.82x,
+gate_up parity, everything <=6144 slower). Realizable win = int4 lm_head alone (~6% of 4B decode,
+non-exact). Conclusion: a general quant speedup is not available on Ada at batch-1 without a
+Marlin-class small-N kernel. Numbers in [../records.md](../records.md).
+
 ### 2026-06-26 — Chunked greedy decode (0.6B +7%) + dead-code removal
 
 Cleanup: removed the off-by-default StaticCache HF-path experiment (superseded by the cudagraph

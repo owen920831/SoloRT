@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1.7
+# torch 2.6 + CUDA 12.4 runtime (driver-safe on the 12.6 / 560.94 host; NGC 25.x's CUDA 12.8 would
+# need driver 570+). Adds torchao for int8/fp8 weight-only quantization, the lever the bf16-roofline
+# 4B decode needs. Not based on NGC -> no flashinfer (the cudagraph fast path owns its KV).
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app/src \
+    SOLORT_EXECUTOR=cudagraph \
+    SOLORT_MODEL_ID=Qwen/Qwen3-4B \
+    SOLORT_GRAPH_MAX_LEN=1024 \
+    SOLORT_ENABLE_THINKING=0 \
+    HF_HOME=/root/.cache/huggingface
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY docs ./docs
+COPY scripts ./scripts
+COPY tests ./tests
+COPY benchmarks ./benchmarks
+
+# torch>=2.5 in the model extra is already satisfied by the 2.6 base, so pip leaves it untouched.
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -e ".[dev]" \
+    && python -m pip install "accelerate>=0.34" "transformers>=4.51.0,<5" "hf_transfer>=0.1.8" \
+        "torchao==0.9.0"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "solort.api.server:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
