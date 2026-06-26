@@ -1,5 +1,22 @@
 # Benchmark records
 
+## 2026-06-26 — Grouped attention (no KV repeat): 4B 55 -> 67 tps (1.21x vLLM)
+
+The decode attention used `repeat_interleave` to GQA-expand KV to `[nh, bound, hd]` every step
+(4x memory traffic for 4B's 32/8 heads) before SDPA. Micro-benchmark: SDPA+repeat ~330-390us/call
+(repeat dominates, ~flat in bound) vs grouped matmul 173-184us (1.9x). Replaced it with grouped
+attention reading the cache as `[nkv, bound, hd]` directly (batched matmul over kv-heads). This also
+fixed the large-buffer slowdown (the KV repeat scaled with the scan).
+
+| path (through server, greedy, graph_max_len=1024) | decode tps | TTFT  | vs vLLM |
+| -------------------------------------------------- | ---------- | ----- | ------- |
+| 0.6B cudagraph                                     | 149        | 11ms  | 1.64x   |
+| 4B cudagraph                                       | **67**     | 27ms  | **1.21x** |
+| vLLM 0.6B / 4B                                     | 91 / 55.6  | 22/30 | 1.0x    |
+
+4B no longer needs a tiny graph_max_len to beat vLLM — grouped attention gives 1.21x at 1024
+context. **SoloRT now beats vLLM on both models, decode AND TTFT.** Output verified coherent.
+
 ## 2026-06-26 — Graphed bucketed prefill: TTFT 74ms -> 20ms (beats vLLM)
 
 TTFT profiling: it was ~entirely the **eager prefill forward** (74ms for a 24-token prompt;

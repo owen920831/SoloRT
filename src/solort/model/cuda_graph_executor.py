@@ -163,7 +163,9 @@ class _GraphQwen3Runner:
     def _decode_forward(self, bound: int) -> torch.Tensor:
         cos, sin = self._cos_sin(self.pos_buf)
         x = self.embed[self.tok_buf].to(self.dt)
-        keep = (self.arange[:bound] <= self.pos_buf).view(1, 1, bound)  # only scan `bound` keys
+        # Mask (True = ignore) for the live length; grouped attention avoids materializing the
+        # GQA-expanded KV (repeat_interleave), reading the cache as [nkv, bound, hd] directly.
+        nkeep = (self.arange[:bound] > self.pos_buf).view(1, 1, bound)
         for li, ly in enumerate(self.layers):
             h = _rmsnorm(x, ly["in_ln"], self.eps)
             qkv = h @ ly["wqkv"].T
@@ -175,13 +177,11 @@ class _GraphQwen3Runner:
             k = self._rope(_rmsnorm(k, ly["kn"], self.eps), cos, sin)
             self.kc[li].index_copy_(0, self.pos_buf, k.transpose(0, 1))
             self.vc[li].index_copy_(0, self.pos_buf, v.transpose(0, 1))
-            kk = self.kc[li, :bound].permute(1, 0, 2).repeat_interleave(self.groups, 0)
-            vv = self.vc[li, :bound].permute(1, 0, 2).repeat_interleave(self.groups, 0)
-            ctx = (
-                F.scaled_dot_product_attention(q, kk, vv, attn_mask=keep, scale=self.scale)
-                .transpose(0, 1)
-                .reshape(1, self.nh * self.hd)
-            )
+            qg = q.reshape(self.nkv, self.groups, self.hd)        # [nkv, groups, hd]
+            kt = self.kc[li, :bound].permute(1, 2, 0)             # [nkv, hd, bound]
+            vb = self.vc[li, :bound].permute(1, 0, 2)             # [nkv, bound, hd]
+            sc = (torch.matmul(qg, kt) * self.scale).masked_fill(nkeep, float("-inf"))
+            ctx = torch.matmul(torch.softmax(sc, -1).to(self.dt), vb).reshape(1, self.nh * self.hd)
             x = x + ctx @ ly["wo"].T
             h2 = _rmsnorm(x, ly["post_ln"], self.eps)
             gate, up = (h2 @ ly["wgu"].T).split([self.inter, self.inter], dim=-1)
