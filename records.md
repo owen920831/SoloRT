@@ -1,5 +1,24 @@
 # Benchmark records
 
+## 2026-06-26 — Graphed bucketed prefill: TTFT 74ms -> 20ms (beats vLLM)
+
+TTFT profiling: it was ~entirely the **eager prefill forward** (74ms for a 24-token prompt;
+tokenize 0.2ms, first decode 0.15ms). Eager prefill = ~360 kernel launches across 36 layers ->
+launch-bound, exactly what graphs fixed for decode. Fix = **graphed bucketed prefill**: pad the
+prompt to a length bucket (16/32/64/.../1024), causal-forward it in one captured graph, read the
+last real position's hidden, apply lm_head eagerly for that one position (the graph outputs
+[bound,hidden] ~MBs, not [bound,vocab] ~600MB). Real tokens never attend padding (causal order), so
+output is exact; padding KV is masked out by decode.
+
+| metric                  | before | after  | vLLM    |
+| ----------------------- | ------ | ------ | ------- |
+| prefill (24-tok, isolated) | 74ms | 20.6ms | -       |
+| TTFT through server, 0.6B  | ~60ms | 13ms  | 22ms    |
+| TTFT through server, 4B    | ~75ms | 33ms  | 30ms    |
+
+Output verified coherent + exact (English, Traditional Chinese, lists). So SoloRT now beats/matches
+vLLM on TTFT too (0.6B 13<22, 4B 33~=30), on top of the decode wins.
+
 ## 2026-06-26 — Bucketed decode graphs: 0.6B 2.02x vLLM, 4B parity-to-1.19x
 
 cProfile of the decode loop settled the bottleneck: 88% of time is `.item()` blocking on the GPU

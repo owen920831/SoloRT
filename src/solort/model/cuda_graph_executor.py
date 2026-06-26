@@ -78,6 +78,14 @@ class _GraphQwen3Runner:
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._logits: dict[int, torch.Tensor] = {}
         self._tok: dict[int, torch.Tensor] = {}  # in-graph greedy argmax per bucket
+        # Bucketed prefill graphs (kill the eager-prefill launch overhead that dominates TTFT).
+        # Finer low buckets so short prompts pad little.
+        self.pre_buckets = sorted(
+            {b for b in (16, 32, 64, 128, 256, 512, 1024) if b <= self.max_len}
+        )
+        self.pre_tok = torch.zeros(self.max_len, dtype=torch.long, device=self.dev)
+        self._pre_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._pre_hidden: dict[int, torch.Tensor] = {}
         # Verify graph (fixed K+1 tokens) for speculative decoding; lazily captured.
         self.verify_graph: torch.cuda.CUDAGraph | None = None
         self.vtok: torch.Tensor | None = None
@@ -93,9 +101,13 @@ class _GraphQwen3Runner:
         d = x.shape[-1] // 2
         return x * cos + torch.cat([-x[..., d:], x[..., :d]], -1) * sin
 
-    def prefill(self, ids: torch.Tensor) -> torch.Tensor:
-        """Process the full prompt into KV; return logits [1, vocab] for the last position."""
-        t = int(ids.shape[0])
+    def _prefill_forward(self, bound: int) -> torch.Tensor:
+        """Causal forward over the padded prompt buffer pre_tok[:bound]; returns hidden [bound,hid].
+
+        Real tokens never attend padding (padding sits at later causal positions), so the hidden at
+        the real positions is exact; padding KV is garbage but the decode mask never reads it."""
+        t = bound
+        ids = self.pre_tok[:bound]
         cos, sin = self._cos_sin(torch.arange(t, device=self.dev))
         x = self.embed[ids].to(self.dt)
         for li, ly in enumerate(self.layers):
@@ -120,8 +132,33 @@ class _GraphQwen3Runner:
             h2 = _rmsnorm(x, ly["post_ln"], self.eps)
             gate, up = (h2 @ ly["wgu"].T).split([self.inter, self.inter], dim=-1)
             x = x + (F.silu(gate) * up) @ ly["wd"].T
-        x = _rmsnorm(x, self.final_norm, self.eps)
-        return (x[-1:] @ self.lm_head.T).float()
+        return _rmsnorm(x, self.final_norm, self.eps)  # [bound, hidden] (lm_head applied later)
+
+    def _capture_prefill(self, bound: int) -> None:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                hid = self._prefill_forward(bound)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hid = self._prefill_forward(bound)
+        self._pre_graphs[bound], self._pre_hidden[bound] = graph, hid
+
+    def prefill(self, ids: torch.Tensor) -> torch.Tensor:
+        """Graphed bucketed prefill: pad the prompt to a bucket, replay; logits [1,vocab] at the
+        last real position. Kills the eager-prefill launch overhead that dominated TTFT. The graph
+        outputs hidden states ([bound,hidden], ~MBs) and the lm_head runs eagerly for one position
+        (avoids materializing a [bound,vocab] logits buffer per bucket)."""
+        plen = int(ids.shape[0])
+        bound = next(b for b in self.pre_buckets if b >= plen)
+        self.pre_tok[:plen].copy_(ids)
+        self.pre_tok[plen:bound].zero_()
+        if bound not in self._pre_graphs:
+            self._capture_prefill(bound)
+        self._pre_graphs[bound].replay()
+        return (self._pre_hidden[bound][plen - 1 : plen] @ self.lm_head.T).float()
 
     def _decode_forward(self, bound: int) -> torch.Tensor:
         cos, sin = self._cos_sin(self.pos_buf)
