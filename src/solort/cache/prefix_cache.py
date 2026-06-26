@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 @dataclass
 class PrefixCacheEntry:
     key: str
-    token_hash_chain: tuple[int, ...]
     token_ids: tuple[int, ...]
     pages: list[int]
     token_count: int
@@ -93,7 +92,6 @@ class PrefixCache:
         key = self.make_key(token_ids)
         entry = PrefixCacheEntry(
             key=key,
-            token_hash_chain=self.make_hash_chain(token_ids),
             token_ids=tuple(token_ids),
             pages=list(pages),
             token_count=len(token_ids),
