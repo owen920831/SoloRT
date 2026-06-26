@@ -8,6 +8,9 @@
 SoloRT 鎖定介於玩具範例與資料中心服務堆疊之間的本地互動工作負載:一位使用者、一張消費級 NVIDIA GPU、
 長時間存續的 chat / code / RAG / agent 工作階段,並且偏好低前景延遲而非整體吞吐量。
 
+> 📖 **完整中文文件在 [docs/zh/](docs/zh/README.md)** —— 包含 end-to-end 教學、系統架構、快速路徑原理、
+> 優化歷程與效能解析,並附大量示意圖。新手建議從 [快速上手](docs/zh/01-快速上手/README.md) 開始。
+
 ## 效能
 
 單流(single-stream)、greedy、精確輸出,RTX 4080 16 GB,Qwen3,對比 vLLM v0.8.5

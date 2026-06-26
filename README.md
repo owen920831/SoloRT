@@ -10,6 +10,9 @@ SoloRT targets the local interactive workload between a toy demo and a data-cent
 one user, one consumer NVIDIA GPU, long-lived chat/code/RAG/agent sessions, and a strong preference
 for low foreground latency over aggregate throughput.
 
+> 📖 Full **Traditional-Chinese documentation** (end-to-end tutorial, architecture, internals,
+> optimization journey, performance — with many diagrams) lives in [docs/zh/](docs/zh/README.md).
+
 ## Performance
 
 Single-stream, greedy, exact, RTX 4080 16 GB, Qwen3, vs vLLM v0.8.5 (`SOLORT_EXECUTOR=cudagraph`):
