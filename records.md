@@ -23,20 +23,32 @@ greedy argmax INTO the CUDA graph (pipelined on-GPU, read a 1-element token) rem
 async/SSE/HTTP + runtime per-token work, which is the next lever. With the per-token argmax cost
 gone, spec and target-only nearly converge — spec amortized exactly that cost.)
 
-### + incremental detokenization -> 4B target-only BEATS vLLM (1.02x)
+### + incremental detok + skip unused paged-KV bookkeeping
 
 Replaced the O(n^2) full-sequence re-decode (`_decode_delta`) with HF/vLLM-style incremental
-detokenization (decode only a bounded suffix window, defer on a trailing replacement char). Profiling
-of the server path showed HTTP/SSE adds ~nothing (RuntimeCore no-HTTP 52.7 tps ~= through-server),
-so the per-token overhead was runtime+detok, not HTTP.
+detokenization (bounded suffix window, defer on a trailing replacement char), and skip
+ensure_capacity/_attach_kv_metadata for the cudagraph executor (it owns its KV). HTTP/SSE adds
+~nothing (RuntimeCore no-HTTP 52.7 tps ~= through-server), so the residual per-token overhead is
+runtime Python, not HTTP. Multi-byte streaming verified coherent (Traditional Chinese).
 
-| 4B path (through server, greedy) | tps  | vs vLLM 55.6 |
-| -------------------------------- | ---- | ------------ |
-| cudagraph target-only            | 56.8 | **1.02x**    |
+### CLEAN final numbers (warmup 2, runs 6) — honest
 
-Multi-byte streaming verified coherent (Traditional Chinese:
-"作業系統核心是控制電腦硬件與軟體互動、管理資源並執行程序的關鍵部分。"). SoloRT now beats
-vLLM single-stream on BOTH 0.6B (1.80x) and 4B (1.02x), greedy, exact.
+| path (through server, greedy)      | decode tps | TTFT  | vs vLLM      |
+| ---------------------------------- | ---------- | ----- | ------------ |
+| 0.6B cudagraph                     | 154        | 59ms  | **1.69x**    |
+| 4B cudagraph target-only           | 51.6       | 83ms  | 0.93x        |
+| 4B cudagraph + spec (K=3)          | 50.5       | 143ms | 0.91x        |
+| vLLM 0.6B / 4B (reference)         | 91 / 55.6  | 22/30ms | 1.0x       |
+
+So: **0.6B beats vLLM decisively (1.69x)**; **4B is ~0.93x** (close). Note the 4B decode *compute*
+already beats vLLM (isolated decode_argmax 59 tps > 55.6), so the ~7% server gap is ~2.4ms/token of
+RuntimeCore/executor **Python** per token (scheduler Batch rebuild, sample/append, async loop), NOT
+GPU. And after moving argmax on-GPU, **speculative decoding no longer helps 4B** — it had only been
+amortizing the per-token eager-argmax cost, which is now gone; the draft + verify overhead now
+slightly exceeds the benefit. TTFT lags vLLM (prefill is eager, not graph-captured).
+
+Next bottleneck = the ~2.4ms/token serving Python (hot-loop micro-opt) and TTFT (graph-capture
+prefill).
 
 ## 2026-06-26 — Speculative decoding on the cudagraph runner (4B beats/ties vLLM)
 
