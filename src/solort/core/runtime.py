@@ -340,10 +340,7 @@ def build_default_runtime() -> RuntimeCore:
     else:
         raise ValueError(f"unknown SOLORT_EXECUTOR={executor_name!r}")
 
-    # StaticCache is the fast default; speculation needs the dynamic-cache path, so requesting
-    # speculative tokens turns StaticCache off.
     speculative_tokens = _env_int("SOLORT_SPECULATIVE_TOKENS", default=0)
-    use_static_cache = _env_bool("SOLORT_STATIC_CACHE", default=False) and speculative_tokens <= 0
 
     executor = executor_cls(
         TransformersGenerationConfig(
@@ -359,7 +356,6 @@ def build_default_runtime() -> RuntimeCore:
             speculative_tokens=speculative_tokens,
             speculative_draft_device_map=os.getenv("SOLORT_SPECULATIVE_DRAFT_DEVICE_MAP"),
             attention_backend=os.getenv("SOLORT_ATTENTION_BACKEND", default_backend),
-            use_static_cache=use_static_cache,
             graph_max_len=_env_int("SOLORT_GRAPH_MAX_LEN", default=1024),
         )
     )
