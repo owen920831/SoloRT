@@ -49,6 +49,9 @@ class RuntimeCore:
         if executor is None:
             raise ValueError("RuntimeCore requires an executor; use build_default_runtime()")
         self.executor = executor
+        # Executors that own their KV (e.g. the cudagraph runner) opt out of SoloRT's paged-KV
+        # bookkeeping so the decode hot path does no unused per-token work.
+        self._uses_paged_kv = bool(getattr(executor, "uses_paged_kv", True))
         attach_kv_cache = getattr(self.executor, "attach_kv_cache", None)
         if callable(attach_kv_cache):
             attach_kv_cache(self.kv_cache)
@@ -182,13 +185,11 @@ class RuntimeCore:
             total_tokens_after_chunk = (
                 sequence.num_cached_tokens + sequence.num_scheduled_tokens + len(batch.input_ids)
             )
-            # Even while the HF bridge owns dense `past_key_values`, SoloRT still builds the paged
-            # metadata that the future FlashInfer paged executor will consume.
-            self.kv_cache.ensure_capacity(sequence.block_table, total_tokens_after_chunk)
-            self._attach_kv_metadata(
-                batch,
-                token_count=total_tokens_after_chunk,
-            )
+            # Build paged metadata only for executors that consume it. The cudagraph executor owns
+            # its own KV, so skipping this avoids wasted per-step Python and unused page allocs.
+            if self._uses_paged_kv:
+                self.kv_cache.ensure_capacity(sequence.block_table, total_tokens_after_chunk)
+                self._attach_kv_metadata(batch, token_count=total_tokens_after_chunk)
             self.executor.forward_prefill(batch)
             self.scheduler.postprocess_batch(batch)
             if (
@@ -207,8 +208,9 @@ class RuntimeCore:
         total_tokens_after_decode = sequence.num_prompt_tokens + len(sequence.output_ids) + 1
         # Decode allocates for exactly one new logical token. Speculative decode may return several
         # accepted tokens, but the current HF bridge keeps their dense cache internally.
-        self.kv_cache.ensure_capacity(sequence.block_table, total_tokens_after_decode)
-        self._attach_kv_metadata(batch, token_count=total_tokens_after_decode)
+        if self._uses_paged_kv:
+            self.kv_cache.ensure_capacity(sequence.block_table, total_tokens_after_decode)
+            self._attach_kv_metadata(batch, token_count=total_tokens_after_decode)
         samples = self._normalize_samples(self.executor.forward_decode(batch))
         token_texts: list[str] = []
         for sample in samples:

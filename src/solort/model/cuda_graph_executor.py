@@ -244,6 +244,7 @@ class CudaGraphQwen3Executor(TransformersTextExecutor):
 
     name = "cudagraph-qwen3"
     supports_prefix_cache = False
+    uses_paged_kv = False  # owns its own static KV; skip RuntimeCore's paged-KV bookkeeping
 
     def __init__(self, config: TransformersGenerationConfig | None = None) -> None:
         super().__init__(config)
