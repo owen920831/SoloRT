@@ -173,8 +173,9 @@ CUDA-graph probe (isolated, Qwen3-0.6B decode, NOT through the serving stack):
 - eager + DynamicCache: 11.9 tok/s
 - eager + StaticCache:  27.0 tok/s  (2.3x — but this win does NOT survive SoloRT's serving stack;
   a clean A/B through the server showed static 13.0 vs dynamic 15.5, i.e. the per-token serving
-  gaps dominate). StaticCache is kept as groundwork (default off); it is the precondition for
-  CUDA-graph capture.
+  gaps dominate). StaticCache was kept as groundwork (default off) as the precondition for
+  CUDA-graph capture, then removed once the custom `cudagraph` executor (its own static KV)
+  superseded the HF-path experiment.
 - torch.compile(reduce-overhead): 0.6 tok/s on torch 2.4 (NGC image) — recompile thrash; needs a
   newer torch (>=2.6), which is the next step.
 

@@ -138,6 +138,8 @@ Findings this iteration (all measured on the 4080):
   per-token serving gaps (async/HTTP/detokenize) dominate and a faster forward just leaves the GPU
   idle/downclocked longer. So StaticCache is kept as **groundwork (default OFF)** — it is the
   precondition for CUDA-graph capture, not a standalone win.
+  *(Update: superseded and removed — the custom `cudagraph` executor owns its own static KV, so the
+  HF-path StaticCache experiment was deleted rather than carried as dead groundwork.)*
 - **Benchmark noise**: batch-1 launch-bound decode swings ~±30% (the same "dynamic" measured
   11.5-15.5 across runs) because it is sensitive to GPU clock state and CPU contention. Lesson:
   isolate runs (nothing else on CPU/GPU), warm up, and prefer locked clocks; small deltas are
