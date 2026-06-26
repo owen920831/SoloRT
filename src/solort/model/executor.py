@@ -50,6 +50,13 @@ class TransformersGenerationConfig:
     # Decode graphs are bucketed (attention scans only the live length), but a larger buffer still
     # costs memory locality, so 1024 balances context vs speed for interactive use.
     graph_max_len: int = 1024
+    # Greedy tokens per cudagraph decode step. >1 pipelines K graph replays back-to-back on the GPU
+    # stream (feeding each on-GPU argmax to the next, no CPU sync between them) and syncs once, so
+    # the fixed per-scheduler-tick Python (Batch rebuild, async hop) amortizes over K tokens. Exact
+    # greedy only; raises inter-token chunk latency by ~K x one token. Measured (RTX 4080): 0.6B
+    # 149->160 tps at K=4 (+7%, peak; K=8 regresses); 4B neutral (its 19 ms/token GPU forward dwarfs
+    # the fixed tick cost). K=4 is the small-model peak and harmless for large models.
+    decode_chunk: int = 4
 
 
 @dataclass

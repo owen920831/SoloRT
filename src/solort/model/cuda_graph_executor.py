@@ -233,6 +233,15 @@ class _GraphQwen3Runner:
         self.pos_buf.fill_(int(pos))
         return self._logits[self._replay(pos)].argmax(-1)
 
+    def decode_gpu_argmax(self, tok_t: torch.Tensor, pos: int) -> torch.Tensor:
+        """Greedy decode from a GPU-resident token, reading the in-graph argmax (no eager vocab
+        argmax, no CPU sync). Returns the next token as a [1] GPU tensor, cloned so the next replay
+        of this bucket does not clobber it. Lets the chunked decoder pipeline K replays back-to-back
+        on the stream and sync once."""
+        self.tok_buf.copy_(tok_t.view(1))
+        self.pos_buf.fill_(int(pos))
+        return self._tok[self._replay(pos)].clone()
+
     def _verify_forward(self) -> torch.Tensor:
         k1 = self.vtok.shape[0]
         pos = self.vpos0 + torch.arange(k1, device=self.dev)
@@ -297,6 +306,7 @@ class CudaGraphQwen3Executor(TransformersTextExecutor):
         if self._model_device().type != "cuda":
             raise RuntimeError("CudaGraphQwen3Executor requires CUDA")
         self._max_len = int(self.config.graph_max_len)
+        self._decode_chunk = max(1, int(getattr(self.config, "decode_chunk", 1)))
         self._runner = _GraphQwen3Runner(self.model, self._max_len)
 
     def forward_prefill(self, batch: Batch) -> None:
@@ -324,29 +334,50 @@ class CudaGraphQwen3Executor(TransformersTextExecutor):
         state = self._ensure_state(sequence)
         if state.finished:
             return SampleResult(token_id=self._eos_token_id(), text="", finished=True)
-        if state.pending_token_id is None:
-            if not state.generated_token_ids:
-                state.finished = True
-                self._states.pop(sequence.seq_id, None)
-                return SampleResult(token_id=self._eos_token_id(), text="", finished=True)
-            position = state.prompt_token_count + len(state.generated_token_ids)
-            if position >= self._max_len:
-                raise RuntimeError(
-                    "decode position exceeds graph_max_len; raise SOLORT_GRAPH_MAX_LEN"
-                )
+        # First token after prefill is already cached on the state; emit it directly.
+        if state.pending_token_id is not None:
+            token_id = int(state.pending_token_id)
+            state.pending_token_id = None
+            return self._append_token_result(sequence, state, token_id)
+        if not state.generated_token_ids:
+            state.finished = True
+            self._states.pop(sequence.seq_id, None)
+            return SampleResult(token_id=self._eos_token_id(), text="", finished=True)
+        position = state.prompt_token_count + len(state.generated_token_ids)
+        if position >= self._max_len:
+            raise RuntimeError("decode position exceeds graph_max_len; raise SOLORT_GRAPH_MAX_LEN")
+
+        if not self._is_greedy(sequence):
             with self._torch.no_grad():
-                if self._is_greedy(sequence):
-                    # Greedy: read the in-graph argmax (1 elem) instead of an eager argmax over the
-                    # whole vocab -> ~1.3x faster decode (the eager argmax was ~5ms/token).
-                    state.pending_token_id = self._runner.decode_argmax(
-                        state.generated_token_ids[-1], position
-                    )
-                else:
-                    logits = self._runner.decode(state.generated_token_ids[-1], position)
-                    state.pending_token_id = self._sample_token(logits, sequence)
-        token_id = int(state.pending_token_id if state.pending_token_id is not None else 0)
-        state.pending_token_id = None
-        return self._append_token_result(sequence, state, token_id)
+                logits = self._runner.decode(state.generated_token_ids[-1], position)
+                token_id = self._sample_token(logits, sequence)
+            return self._append_token_result(sequence, state, token_id)
+
+        # Greedy: read the in-graph argmax (1 elem, not an eager argmax over the whole vocab) and,
+        # when decode_chunk>1, pipeline K replays back-to-back on the GPU stream with a single CPU
+        # sync so the per-token RuntimeCore/executor Python amortizes over K tokens.
+        remaining = sequence.max_new_tokens - len(state.generated_token_ids)
+        k = max(1, min(self._decode_chunk, remaining, self._max_len - position))
+        with self._torch.no_grad():
+            if k == 1:
+                ids = [self._runner.decode_argmax(state.generated_token_ids[-1], position)]
+            else:
+                cur = self._torch.tensor(
+                    [state.generated_token_ids[-1]],
+                    dtype=self._torch.long,
+                    device=self._model_device(),
+                )
+                toks = []
+                for i in range(k):
+                    cur = self._runner.decode_gpu_argmax(cur, position + i)
+                    toks.append(cur)
+                ids = self._torch.cat(toks).tolist()  # one GPU->CPU sync for the whole chunk
+        results: list[SampleResult] = []
+        for token_id in ids:
+            results.append(self._append_token_result(sequence, state, int(token_id)))
+            if state.finished:  # stop tokens past the boundary were speculative; drop them
+                break
+        return results
 
     def _is_greedy(self, sequence: Sequence) -> bool:
         temp = float(sequence.metadata.get("temperature", self.config.default_temperature))

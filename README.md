@@ -76,8 +76,10 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 | `transformers` | Same HF bridge with `attention_backend=auto`. |
 
 `SOLORT_GRAPH_MAX_LEN` bounds prompt+generation for the cudagraph static KV (default 1024; larger
-costs memory locality). `SOLORT_SPECULATIVE_TOKENS=K` adds an exact graphed-draft speculative path
-(0.6B draft → 4B target); after the on-GPU argmax it no longer beats the target-only cudagraph.
+costs memory locality). `SOLORT_DECODE_CHUNK=K` (default 4) emits K greedy tokens per decode step,
+pipelined on the GPU stream with one CPU sync, to amortize the fixed per-step Python (+7% on 0.6B,
+neutral on 4B; exact greedy). `SOLORT_SPECULATIVE_TOKENS=K` adds an exact graphed-draft speculative
+path (0.6B draft → 4B target); after the on-GPU argmax it no longer beats the target-only cudagraph.
 
 ## Running Other Models
 

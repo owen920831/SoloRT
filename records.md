@@ -1,5 +1,31 @@
 # Benchmark records
 
+## 2026-06-26 — Chunked greedy decode: 0.6B 149 -> 160 tps (+7%); 4B neutral
+
+After moving the argmax on-GPU, the records pinned the residual ~2.4 ms/token to RuntimeCore/executor
+**Python**, not HTTP or GPU. A microbench (`scripts/microbench_decode.py`) split that: the runner
+ceiling for 0.6B is ~239 tps (tight no-sync) vs 217 tps with a per-token `.item()` — so the per-token
+*sync* is only ~10%; the rest of the gap to the ~149-tps server number is the per-scheduler-tick
+Python (Batch rebuild, async hop), paid once per `forward_decode`.
+
+`SOLORT_DECODE_CHUNK=K` (cudagraph, greedy) pipelines K decode replays back-to-back on the GPU stream
+via `decode_gpu_argmax` (on-GPU in-graph argmax, no CPU sync between replays), syncs once, and returns
+K tokens per `forward_decode` — amortizing that fixed tick cost over K. Exact greedy (the argmax is the
+same in-graph op; chunk=1 and chunk=4 produced bit-identical completions: 115/115 chars 0.6B, 177/177
+4B). A/B through the server (RTX 4080, warmup 2, runs 5, 200 tokens):
+
+| K | 0.6B decode tps | 0.6B itl_p95 | 4B decode tps (gml=256) |
+| - | --------------- | ------------ | ----------------------- |
+| 1 | 149.3           | 7.7 ms       | 51.5                    |
+| 2 | 152.5           | 13.4 ms      | -                       |
+| 4 | **160.3**       | 24.5 ms      | 51.0 (neutral)          |
+| 8 | 138.6 (regress) | 46 ms        | -                       |
+
+K=4 is the small-model peak (+7%, 0.6B 1.64x -> ~1.76x vLLM); K=8 overshoots and regresses. 4B is
+neutral — its ~19 ms/token GPU forward dwarfs the fixed tick cost, so there is nothing to amortize.
+Default K=4: a free small-model win, harmless for large models, TTFT unchanged. Streaming is chunkier
+(K tokens arrive together) but at <=24 ms/chunk it stays smooth for interactive use.
+
 ## 2026-06-26 — Grouped attention (no KV repeat): 4B 55 -> 67 tps (1.21x vLLM)
 
 The decode attention used `repeat_interleave` to GQA-expand KV to `[nh, bound, hd]` every step

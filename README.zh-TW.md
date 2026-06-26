@@ -74,8 +74,9 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 | `transformers` | 同上的 HF 橋接,`attention_backend=auto`。 |
 
 `SOLORT_GRAPH_MAX_LEN` 限定 cudagraph static KV 的 prompt+生成長度(預設 1024;愈大記憶體區域性愈差)。
-`SOLORT_SPECULATIVE_TOKENS=K` 啟用精確的 graph 化推測解碼(0.6B draft → 4B target);在 on-GPU argmax 之後
-已不再勝過純 target 的 cudagraph。
+`SOLORT_DECODE_CHUNK=K`(預設 4)每個解碼步驟輸出 K 個 greedy token,於 GPU stream 上連續 pipeline、只做一次
+CPU 同步,以攤平每步固定的 Python 開銷(0.6B +7%、4B 持平;精確 greedy)。`SOLORT_SPECULATIVE_TOKENS=K`
+啟用精確的 graph 化推測解碼(0.6B draft → 4B target);在 on-GPU argmax 之後已不再勝過純 target 的 cudagraph。
 
 ## 使用其他模型
 

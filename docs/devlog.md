@@ -153,6 +153,21 @@ thrashes, the next iteration builds a SoloRT image on torch >=2.6 (cu124, driver
 enables `torch.compile(reduce-overhead)` + StaticCache on the decode path, measured vs the vLLM
 baseline.
 
+### 2026-06-26 — Chunked greedy decode (0.6B +7%) + dead-code removal
+
+Cleanup: removed the off-by-default StaticCache HF-path experiment (superseded by the cudagraph
+executor's own static KV) and several zero-reference stubs (`flashattn_backend`, `attention_base`,
+`loader`, `flashinfer_backend` + test, a dead prefix-cache field).
+
+Optimization: with the eager argmax already on-GPU, the residual gap was pinned to per-token Python.
+A runner microbench (`scripts/microbench_decode.py`) showed the per-token `.item()` sync is only
+~10% (0.6B 217 vs 239 tps tight) — the rest is the **per-scheduler-tick** Python paid once per
+`forward_decode`. So `SOLORT_DECODE_CHUNK=K` returns K greedy tokens per decode step, pipelining K
+graph replays back-to-back on the stream (`decode_gpu_argmax`, on-GPU argmax, no inter-replay sync)
+and syncing once. Measured: 0.6B 149 -> 160 tps at K=4 (+7%, peak; K=8 regresses), 4B neutral (19
+ms/token GPU dwarfs the fixed cost). Exact greedy (bit-identical completions). Default K=4. Numbers
+in [../records.md](../records.md).
+
 ### 2026-06-26 — Code simplification pass
 
 Ran a fan-out review (one finder per source file) + synthesis; applied the 16 verified-safe,
