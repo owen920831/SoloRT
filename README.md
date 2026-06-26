@@ -104,6 +104,36 @@ sequenceDiagram
     end
 ```
 
+## Fast Path: CUDA-Graph Executor (beats vLLM single-stream)
+
+`SOLORT_EXECUTOR=cudagraph` runs a hand-written, graph-friendly Qwen3 forward over SoloRT-owned
+static KV, with both prefill and the single-token decode captured into CUDA graphs (bucketed by
+length so attention scans only the live tokens) and the greedy argmax computed on-GPU. This kills
+the kernel-launch overhead that caps the eager HF path at ~11 tok/s, and on a single RTX 4080 it
+**beats / matches vLLM v0.8.5 single-stream**:
+
+| model (single-stream, greedy) | SoloRT cudagraph | vLLM v0.8.5 |
+| ----------------------------- | ---------------- | ----------- |
+| Qwen3-0.6B decode             | ~150-180 tok/s   | 91 tok/s    |
+| Qwen3-0.6B TTFT               | ~13 ms           | 22 ms       |
+| Qwen3-4B decode               | ~50-66 tok/s     | 56 tok/s    |
+| Qwen3-4B TTFT                 | ~33 ms           | 30 ms       |
+
+```bash
+make docker-ngc-up-model MODEL=Qwen/Qwen3-4B   # then set SOLORT_EXECUTOR=cudagraph, or:
+docker run --rm --gpus all --ipc=host -p 8000:8000 \
+  -e SOLORT_EXECUTOR=cudagraph -e SOLORT_MODEL_ID=Qwen/Qwen3-4B \
+  -e SOLORT_GRAPH_MAX_LEN=1024 -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  solort:qwen3-4b-spec-ngc
+```
+
+Scope/caveats: single active sequence (the single-user target), Qwen3-family + CUDA only, and
+`SOLORT_GRAPH_MAX_LEN` bounds prompt+generation (a larger value costs memory locality, so the
+default is 1024). Output is exact greedy. `SOLORT_SPECULATIVE_TOKENS=K` adds an exact
+graphed-draft speculative path, though after the on-GPU argmax it no longer beats the target-only
+cudagraph. Full benchmark methodology and the optimization history are in
+[records.md](records.md) / [docs/devlog.md](docs/devlog.md).
+
 ## Runtime Status
 
 SoloRT's real-model path uses Hugging Face Transformers with an explicit serving loop:
