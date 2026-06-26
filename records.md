@@ -23,6 +23,21 @@ greedy argmax INTO the CUDA graph (pipelined on-GPU, read a 1-element token) rem
 async/SSE/HTTP + runtime per-token work, which is the next lever. With the per-token argmax cost
 gone, spec and target-only nearly converge — spec amortized exactly that cost.)
 
+### + incremental detokenization -> 4B target-only BEATS vLLM (1.02x)
+
+Replaced the O(n^2) full-sequence re-decode (`_decode_delta`) with HF/vLLM-style incremental
+detokenization (decode only a bounded suffix window, defer on a trailing replacement char). Profiling
+of the server path showed HTTP/SSE adds ~nothing (RuntimeCore no-HTTP 52.7 tps ~= through-server),
+so the per-token overhead was runtime+detok, not HTTP.
+
+| 4B path (through server, greedy) | tps  | vs vLLM 55.6 |
+| -------------------------------- | ---- | ------------ |
+| cudagraph target-only            | 56.8 | **1.02x**    |
+
+Multi-byte streaming verified coherent (Traditional Chinese:
+"作業系統核心是控制電腦硬件與軟體互動、管理資源並執行程序的關鍵部分。"). SoloRT now beats
+vLLM single-stream on BOTH 0.6B (1.80x) and 4B (1.02x), greedy, exact.
+
 ## 2026-06-26 — Speculative decoding on the cudagraph runner (4B beats/ties vLLM)
 
 `SOLORT_EXECUTOR=cudagraph SOLORT_SPECULATIVE_TOKENS=3` (4B target + 0.6B draft). Both models run

@@ -65,6 +65,10 @@ class _ServingState:
     generated_token_ids: list[int]
     decoded_text: str = ""
     finished: bool = False
+    # Incremental detokenization offsets (HF/vLLM style): decode only a bounded suffix window per
+    # token instead of the whole sequence (the old O(n^2) re-decode).
+    detok_prefix_offset: int = 0
+    detok_read_offset: int = 0
     # Incremental draft-model KV cache + the number of committed tokens it covers. The cache holds
     # only the accepted prefix between speculative rounds; proposed tokens are cropped off because
     # the target may reject them.
@@ -685,14 +689,26 @@ class TransformersTextExecutor:
         if token_id == self._eos_token_id():
             return ""
 
-        new_text = self.tokenizer.decode(
-            state.generated_token_ids,
+        # Incremental detokenization: decode only the bounded suffix window [prefix_offset:] and
+        # diff against [prefix_offset:read_offset]. The window stays small (offsets advance), so it
+        # is O(window) per token instead of re-decoding the whole sequence. Defer emitting while the
+        # decode ends in a replacement char (an incomplete multi-token character).
+        tokens = state.generated_token_ids
+        prefix_text = self.tokenizer.decode(
+            tokens[state.detok_prefix_offset : state.detok_read_offset],
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        delta = _text_delta(state.decoded_text, new_text)
-        state.decoded_text = new_text
-        return delta
+        new_text = self.tokenizer.decode(
+            tokens[state.detok_prefix_offset :],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
+            return ""
+        state.detok_prefix_offset = state.detok_read_offset
+        state.detok_read_offset = len(tokens)
+        return new_text[len(prefix_text) :]
 
     def _eos_token_id(self) -> int:
         token_id = self.tokenizer.eos_token_id
